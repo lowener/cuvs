@@ -30,28 +30,16 @@
 namespace cuvs::neighbors::ivf_flat {
 
 #define CUVS_INST_IVF_FLAT_SEARCH(T, IdxT)                                                  \
-  extern template void detail::search_with_filtering<                                               \
-      T, IdxT, cuvs::neighbors::filtering::bitset_filter<uint32_t, IdxT>>(                  \
+  template void detail::search_with_filtering<                                               \
+      T, IdxT, cuvs::neighbors::filtering::bitset_filter<uint32_t, IdxT>>(                         \
     raft::resources const& handle,                                                          \
     const search_params& params,                                                            \
     const index<T, IdxT>& index,                                                            \
     raft::device_matrix_view<const T, IdxT, raft::row_major> queries,                       \
     raft::device_matrix_view<IdxT, IdxT, raft::row_major> neighbors,                        \
     raft::device_matrix_view<float, IdxT, raft::row_major> distances,                       \
-    cuvs::neighbors::filtering::bitset_filter<uint32_t, IdxT> sample_filter);               \
-                                                                                            \
-  void search(                                                                              \
-    raft::resources const& handle,                                                          \
-    const search_params& params,                                                            \
-    index<T, IdxT>& idx,                                                                    \
-    raft::device_matrix_view<const T, IdxT, raft::row_major> queries,                       \
-    raft::device_matrix_view<IdxT, IdxT, raft::row_major> neighbors,                        \
-    raft::device_matrix_view<float, IdxT, raft::row_major> distances,                       \
-    std::optional<cuvs::neighbors::filtering::bitset_filter<uint32_t, IdxT>> sample_filter) \
-  {                                                                                         \
-    cuvs::neighbors::ivf_flat::detail::search(                                              \
-      handle, params, idx, queries, neighbors, distances, sample_filter);                   \
-  }
+    cuvs::neighbors::filtering::bitset_filter<uint32_t, IdxT> sample_filter);
+
 CUVS_INST_IVF_FLAT_SEARCH(int8_t, int64_t);
 
 #undef CUVS_INST_IVF_FLAT_SEARCH

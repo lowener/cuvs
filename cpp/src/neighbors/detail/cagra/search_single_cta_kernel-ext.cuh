@@ -117,7 +117,38 @@ instantiate_single_cta_select_and_run(
   16, 256, uint8_t, uint32_t, float, cuvs::neighbors::filtering::none_cagra_sample_filter);
 instantiate_single_cta_select_and_run(
   32, 512, uint8_t, uint32_t, float, cuvs::neighbors::filtering::none_cagra_sample_filter);
-
+instantiate_single_cta_select_and_run(
+  32, 1024, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  8, 128, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  16, 256, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 512, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 1024, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  8, 128, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  16, 256, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 512, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 1024, int8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  8, 128, int8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  16, 256, int8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 512, int8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 1024, uint8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  8, 128, uint8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  16, 256, uint8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_single_cta_select_and_run(
+  32, 512, uint8_t, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
 #undef instantiate_single_cta_select_and_run
 
 #define instantiate_q_single_cta_select_and_run(TEAM_SIZE,                                      \
@@ -581,7 +612,421 @@ instantiate_q_single_cta_select_and_run(32,
                                         int64_t,
                                         float,
                                         cuvs::neighbors::filtering::none_cagra_sample_filter);
+single_cta_select_and_run(
+  8, 128, half, 8, 2, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 2, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 2, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        half,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 4, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 4, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 4, half, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        half,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
 
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 2, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        2,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        2,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 4, float, uint32_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        4,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        4,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        float,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 2, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 2, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 2, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 1024, half, 8, 2, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 4, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 4, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 4, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 1024, half, 8, 4, half, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 2, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 2, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 2, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        float,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 4, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  16, 256, half, 8, 4, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  32, 512, half, 8, 4, float, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        float,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        uint32_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(8,
+                                        128,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        uint8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 2, int8_t, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        2,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(
+  8, 128, half, 8, 4, int8_t, int64_t, float, cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(16,
+                                        256,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        512,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
+instantiate_q_single_cta_select_and_run(32,
+                                        1024,
+                                        half,
+                                        8,
+                                        4,
+                                        int8_t,
+                                        int64_t,
+                                        float,
+                                        cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>);
 #undef instantiate_q_single_cta_select_and_run
 
 }  // namespace single_cta_search

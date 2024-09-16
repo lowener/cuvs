@@ -66,18 +66,21 @@ search_types = dict(
     float_uint64=("float", "uint64_t", "float"),
     half_uint64=("half", "uint64_t", "float"),
 )
+filters=["none_cagra_sample_filter", "bitset_filter<uint32_t COMMA int64_t>"]
 # knn
 for type_path, (data_t, idx_t, distance_t) in search_types.items():
     for (mxdim, team) in mxdim_team:
         for code_book_t in code_book_types:
             for subspace_dim in subspace_dims:
                 for pq_bit in pq_bits:
-                    path = f"q_search_multi_cta_{type_path}_dim{mxdim}_t{team}_{pq_bit}pq_{subspace_dim}subd_{code_book_t}.cu"
-                    with open(path, "w") as f:
-                        f.write(header)
-                        f.write(
-                                f"instantiate_kernel_selection(\n  {team}, {mxdim}, cuvs::neighbors::cagra::detail::cagra_q_dataset_descriptor_t<{data_t} COMMA {code_book_t} COMMA {pq_bit} COMMA {subspace_dim} COMMA {distance_t} COMMA {idx_t}>, cuvs::neighbors::filtering::none_cagra_sample_filter);\n"
-                        )
-                        f.write(trailer)
-                        # For pasting into CMakeLists.txt
-                    print(f"src/neighbors/detail/cagra/{path}")
+                    for sample_filter in filters:
+                        short_filter = sample_filter.split("_")[0]
+                        path = f"q_search_multi_cta_{type_path}_dim{mxdim}_t{team}_{pq_bit}pq_{subspace_dim}subd_{code_book_t}_{short_filter}.cu"
+                        with open(path, "w") as f:
+                            f.write(header)
+                            f.write(
+                                    f"instantiate_kernel_selection(\n  {team}, {mxdim}, cuvs::neighbors::cagra::detail::cagra_q_dataset_descriptor_t<{data_t} COMMA {code_book_t} COMMA {pq_bit} COMMA {subspace_dim} COMMA {distance_t} COMMA {idx_t}>, cuvs::neighbors::filtering::{sample_filter});\n"
+                            )
+                            f.write(trailer)
+                            # For pasting into CMakeLists.txt
+                        print(f"src/neighbors/detail/cagra/{path}")
