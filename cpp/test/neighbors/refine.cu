@@ -34,7 +34,7 @@
 
 namespace cuvs::neighbors {
 
-template <typename DataT, typename DistanceT, typename IdxT>
+template <typename DataT, typename DistanceT, typename IdxT, typename NeighborsIdxT = IdxT>
 class RefineTest : public ::testing::TestWithParam<RefineInputs<IdxT>> {
  public:
   RefineTest()
@@ -47,7 +47,7 @@ class RefineTest : public ::testing::TestWithParam<RefineInputs<IdxT>> {
  public:  // tamas remove
   void testRefine()
   {
-    std::vector<IdxT> indices(data.p.n_queries * data.p.k);
+    std::vector<NeighborsIdxT> indices(data.p.n_queries * data.p.k);
     std::vector<DistanceT> distances(data.p.n_queries * data.p.k);
 
     if (data.p.host_data) {
@@ -99,7 +99,7 @@ class RefineTest : public ::testing::TestWithParam<RefineInputs<IdxT>> {
  public:
   raft::resources handle_;
   rmm::cuda_stream_view stream_;
-  RefineHelper<DataT, DistanceT, IdxT> data;
+  RefineHelper<DataT, DistanceT, IdxT, NeighborsIdxT> data;
 };
 
 const std::vector<RefineInputs<int64_t>> inputs =
@@ -112,16 +112,18 @@ const std::vector<RefineInputs<int64_t>> inputs =
     {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::InnerProduct},
     {false, true});
 
-typedef RefineTest<float, float, std::int64_t> RefineTestF;
+typedef RefineTest<float, float, std::int64_t, std::int64_t> RefineTestF;
+TEST_P(RefineTestF, AnnRefine) { this->testRefine(); }
+typedef RefineTest<float, float, std::int64_t, std::uint32_t> RefineTestF;
 TEST_P(RefineTestF, AnnRefine) { this->testRefine(); }
 
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF, ::testing::ValuesIn(inputs));
 
-typedef RefineTest<uint8_t, float, std::int64_t> RefineTestF_uint8;
+typedef RefineTest<uint8_t, float, std::int64_t, std::int64_t> RefineTestF_uint8;
 TEST_P(RefineTestF_uint8, AnnRefine) { this->testRefine(); }
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF_uint8, ::testing::ValuesIn(inputs));
 
-typedef RefineTest<int8_t, float, std::int64_t> RefineTestF_int8;
+typedef RefineTest<int8_t, float, std::int64_t, std::int64_t> RefineTestF_int8;
 TEST_P(RefineTestF_int8, AnnRefine) { this->testRefine(); }
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF_int8, ::testing::ValuesIn(inputs));
 }  // namespace cuvs::neighbors

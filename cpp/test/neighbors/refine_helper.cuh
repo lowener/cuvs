@@ -43,7 +43,7 @@ struct RefineInputs {
 };
 
 /** Helper class to allocate arrays and generate input data for refinement test and benchmark. */
-template <typename DataT, typename DistanceT, typename IdxT>
+template <typename DataT, typename DistanceT, typename IdxT, typename NeighborsIdxT = IdxT>
 class RefineHelper {
  public:
   RefineHelper(const raft::resources& handle, RefineInputs<IdxT> params)
@@ -78,29 +78,29 @@ class RefineHelper {
     }
 
     refined_distances = raft::make_device_matrix<DistanceT, IdxT>(handle_, p.n_queries, p.k);
-    refined_indices   = raft::make_device_matrix<IdxT, IdxT>(handle_, p.n_queries, p.k);
+    refined_indices   = raft::make_device_matrix<NeighborsIdxT, IdxT>(handle_, p.n_queries, p.k);
 
     // Generate candidate vectors
     {
-      candidates = raft::make_device_matrix<IdxT, IdxT>(handle_, p.n_queries, p.k0);
+      candidates = raft::make_device_matrix<NeighborsIdxT, IdxT>(handle_, p.n_queries, p.k0);
       rmm::device_uvector<DistanceT> distances_tmp(p.n_queries * p.k0, stream_);
-      naive_knn<DistanceT, DataT, IdxT>(handle_,
-                                        distances_tmp.data(),
-                                        candidates.data_handle(),
-                                        queries.data_handle(),
-                                        dataset.data_handle(),
-                                        p.n_queries,
-                                        p.n_rows,
-                                        p.dim,
-                                        p.k0,
-                                        p.metric);
+      naive_knn<DistanceT, DataT, NeighborsIdxT>(handle_,
+                                                 distances_tmp.data(),
+                                                 candidates.data_handle(),
+                                                 queries.data_handle(),
+                                                 dataset.data_handle(),
+                                                 p.n_queries,
+                                                 p.n_rows,
+                                                 p.dim,
+                                                 p.k0,
+                                                 p.metric);
       raft::resource::sync_stream(handle_, stream_);
     }
 
     if (p.host_data) {
       dataset_host    = raft::make_host_matrix<DataT, IdxT>(p.n_rows, p.dim);
       queries_host    = raft::make_host_matrix<DataT, IdxT>(p.n_queries, p.dim);
-      candidates_host = raft::make_host_matrix<IdxT, IdxT>(p.n_queries, p.k0);
+      candidates_host = raft::make_host_matrix<NeighborsIdxT, IdxT>(p.n_queries, p.k0);
 
       raft::copy(dataset_host.data_handle(), dataset.data_handle(), dataset.size(), stream_);
       raft::copy(queries_host.data_handle(), queries.data_handle(), queries.size(), stream_);
@@ -108,24 +108,24 @@ class RefineHelper {
         candidates_host.data_handle(), candidates.data_handle(), candidates.size(), stream_);
 
       refined_distances_host = raft::make_host_matrix<DistanceT, IdxT>(p.n_queries, p.k);
-      refined_indices_host   = raft::make_host_matrix<IdxT, IdxT>(p.n_queries, p.k);
+      refined_indices_host   = raft::make_host_matrix<NeighborsIdxT, IdxT>(p.n_queries, p.k);
       raft::resource::sync_stream(handle_, stream_);
     }
 
     // Generate ground thruth for testing.
     {
       rmm::device_uvector<DistanceT> distances_dev(p.n_queries * p.k, stream_);
-      rmm::device_uvector<IdxT> indices_dev(p.n_queries * p.k, stream_);
-      naive_knn<DistanceT, DataT, IdxT>(handle_,
-                                        distances_dev.data(),
-                                        indices_dev.data(),
-                                        queries.data_handle(),
-                                        dataset.data_handle(),
-                                        p.n_queries,
-                                        p.n_rows,
-                                        p.dim,
-                                        p.k,
-                                        p.metric);
+      rmm::device_uvector<NeighborsIdxT> indices_dev(p.n_queries * p.k, stream_);
+      naive_knn<DistanceT, DataT, NeighborsIdxT>(handle_,
+                                                 distances_dev.data(),
+                                                 indices_dev.data(),
+                                                 queries.data_handle(),
+                                                 dataset.data_handle(),
+                                                 p.n_queries,
+                                                 p.n_rows,
+                                                 p.dim,
+                                                 p.k,
+                                                 p.metric);
       true_refined_distances_host.resize(p.n_queries * p.k);
       true_refined_indices_host.resize(p.n_queries * p.k);
       raft::copy(true_refined_indices_host.data(), indices_dev.data(), indices_dev.size(), stream_);
@@ -142,17 +142,18 @@ class RefineHelper {
 
   raft::device_matrix<DataT, IdxT, raft::row_major> dataset;
   raft::device_matrix<DataT, IdxT, raft::row_major> queries;
-  raft::device_matrix<IdxT, IdxT, raft::row_major> candidates;  // Neighbor candidate indices
-  raft::device_matrix<IdxT, IdxT, raft::row_major> refined_indices;
+  raft::device_matrix<NeighborsIdxT, IdxT, raft::row_major>
+    candidates;  // Neighbor candidate indices
+  raft::device_matrix<NeighborsIdxT, IdxT, raft::row_major> refined_indices;
   raft::device_matrix<DistanceT, IdxT, raft::row_major> refined_distances;
 
   raft::host_matrix<DataT, IdxT, raft::row_major> dataset_host;
   raft::host_matrix<DataT, IdxT, raft::row_major> queries_host;
-  raft::host_matrix<IdxT, IdxT, raft::row_major> candidates_host;
-  raft::host_matrix<IdxT, IdxT, raft::row_major> refined_indices_host;
+  raft::host_matrix<NeighborsIdxT, IdxT, raft::row_major> candidates_host;
+  raft::host_matrix<NeighborsIdxT, IdxT, raft::row_major> refined_indices_host;
   raft::host_matrix<DistanceT, IdxT, raft::row_major> refined_distances_host;
 
-  std::vector<IdxT> true_refined_indices_host;
+  std::vector<NeighborsIdxT> true_refined_indices_host;
   std::vector<DistanceT> true_refined_distances_host;
 };
 }  // namespace cuvs::neighbors
