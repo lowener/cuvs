@@ -3,7 +3,7 @@
 #include "warp_primitives.cuh"
 #include <raft/core/detail/macros.hpp>
 
-namespace raft::util {
+namespace cuvs::tools::util {
 
 namespace {
 
@@ -78,7 +78,8 @@ class bitonic {
    *   the total size of the sorted data is `Size * warp_width`.
    *   Must be power-of-two, not larger than the WarpSize.
    */
-  _RAFT_DEVICE _RAFT_FORCEINLINE explicit bitonic(bool ascending, int warp_width = raft::WarpSize)
+  _RAFT_DEVICE _RAFT_FORCEINLINE explicit bitonic(bool ascending,
+                                                  int warp_width = cuvs::tools::WarpSize)
     : ascending_(ascending), warp_width_(warp_width)
   {
   }
@@ -230,4 +231,4 @@ class bitonic {
   }
 };
 
-}  // namespace raft::util
+}  // namespace cuvs::tools::util

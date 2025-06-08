@@ -117,6 +117,12 @@ set_property(
 )
 message(VERBOSE "cuVS: RMM_LOGGING_LEVEL = '${RMM_LOGGING_LEVEL}'.")
 
+if(NOT CUVS_GENERATED_INCLUDE_DIR)
+  set(CUVS_GENERATED_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR})
+
+endif()
+
+set(CUVS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 # ##################################################################################################
 # * Conda environment detection ----------------------------------------------
 
@@ -173,9 +179,15 @@ include(cmake/modules/ConfigureCUDA.cmake)
 # add third party dependencies using CPM
 rapids_cpm_init()
 
+# find jitify
+include(cmake/thirdparty/get_jitify.cmake)
+
 if(NOT BUILD_CPU_ONLY)
   include(cmake/thirdparty/get_raft.cmake)
 endif()
+
+# preprocess jitify-able kernels
+include(cmake/modules/JitifyPreprocessKernels.cmake)
 
 if(BUILD_C_LIBRARY)
   include(cmake/thirdparty/get_dlpack.cmake)
@@ -196,6 +208,11 @@ endif()
 if(BUILD_CAGRA_HNSWLIB)
   include(cmake/thirdparty/get_hnswlib.cmake)
 endif()
+find_library(
+  CUDA_NVRTC_LIB libnvrtc nvrtc
+  HINTS "${CUDA_TOOLKIT_ROOT_DIR}/lib64" "${LIBNVRTC_LIBRARY_DIR}"
+        "${CUDA_TOOLKIT_ROOT_DIR}/lib/x64" /usr/lib64 /usr/local/cuda/lib64
+)
 
 # ##################################################################################################
 # * cuvs ---------------------------------------------------------------------
@@ -428,11 +445,23 @@ target_compile_options(
 )
 
 add_library(cuvs::cuvs ALIAS cuvs)
+# rapids_find_generate_module( nvrtc HEADER_NAMES nvrtc.h LIBRARY_NAMES nvrtc BUILD_EXPORT_SET
+# cuvs-exports INSTALL_EXPORT_SET cuvs-exports ) rapids_find_package( nvrtc REQUIRED
+# BUILD_EXPORT_SET cuvs-exports INSTALL_EXPORT_SET cuvs-exports )
 
 target_include_directories(
-  cuvs PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-              "$<INSTALL_INTERFACE:include>"
+  cuvs
+  PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+         "$<BUILD_INTERFACE:${JITIFY_INCLUDE_DIR}>"
+         "$<BUILD_INTERFACE:${CUVS_GENERATED_INCLUDE_DIR}/include>"
+         "$<INSTALL_INTERFACE:include>"
 )
+
+# Disable Jitify log printing. See https://github.com/NVIDIA/jitify/issues/79
+target_compile_definitions(cuvs PRIVATE "JITIFY_PRINT_LOG=0")
+
+# Compile stringified JIT sources first
+add_dependencies(cuvs jitify_preprocess_run)
 
 rapids_find_package(
   OpenMP REQUIRED
@@ -454,7 +483,7 @@ if(NOT BUILD_CPU_ONLY)
   # Keep cuVS as lightweight as possible. Only CUDA libs and rmm should be used in global target.
   target_link_libraries(
     cuvs
-    PUBLIC rmm::rmm raft::raft ${CUVS_CTK_MATH_DEPENDENCIES}
+    PUBLIC rmm::rmm raft::raft ${CUVS_CTK_MATH_DEPENDENCIES} # nvrtc
     PRIVATE nvidia::cutlass::cutlass $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX> cuvs-cagra-search
   )
 endif()

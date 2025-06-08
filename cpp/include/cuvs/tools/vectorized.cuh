@@ -9,7 +9,7 @@
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
 
-namespace raft {
+namespace cuvs::tools {
 
 template <typename math_, int VecLen>
 struct IOType {};
@@ -202,4 +202,4 @@ template <>
 struct IOType<double, 2> {
   typedef double2 Type;
 };
-}  // namespace raft
+}  // namespace cuvs::tools

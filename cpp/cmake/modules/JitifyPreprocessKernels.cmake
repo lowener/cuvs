@@ -45,10 +45,10 @@ function(jit_preprocess_files)
         "${CMAKE_COMMAND}" -E env LD_LIBRARY_PATH=${CUDAToolkit_LIBRARY_DIR}
         $<TARGET_FILE:jitify_preprocess> ${ARG_FILE} -o
         ${CUVS_GENERATED_INCLUDE_DIR}/include/jit_preprocessed_files -i # TODO:  -m
-         -std=c++17
-        -remove-unused-globals -D_FILE_OFFSET_BITS=64 -D__CUDACC_RTC__ -I${CUVS_SOURCE_DIR}/include
-        -I/usr/include/c++/11 -I/usr/include/x86_64-linux-gnu/c++/11 -I/usr/include/ -I/usr/include/c++/11/tr1
-        -I${CUVS_SOURCE_DIR}/src ${includes} --no-preinclude-workarounds --no-replace-pragma-once
+        -std=c++17 -remove-unused-globals -D_FILE_OFFSET_BITS=64 -D__CUDACC_RTC__
+        -I${CUVS_SOURCE_DIR}/include -arch=sm_70 -I/usr/include/c++/11
+        -I/usr/include/x86_64-linux-gnu/c++/11 -I/usr/include/ -I/usr/include/c++/11/tr1
+        -I${CUVS_SOURCE_DIR}/src ${includes} --no-replace-pragma-once # --no-preinclude-workarounds
       COMMENT "Custom command to JIT-compile files."
     )
   endforeach()
@@ -63,8 +63,8 @@ if(NOT (EXISTS "${CUVS_GENERATED_INCLUDE_DIR}/include"))
 endif()
 
 jit_preprocess_files(
-  SOURCE_DIRECTORY ${CUVS_SOURCE_DIR}/src
-  FILES neighbors/ivf_flat/ivf_flat_interleaved_scan_kernel.cuh
+  SOURCE_DIRECTORY ${CUVS_SOURCE_DIR}/src FILES
+  neighbors/ivf_flat/ivf_flat_interleaved_scan_kernel.cuh
 )
 
 add_custom_target(
