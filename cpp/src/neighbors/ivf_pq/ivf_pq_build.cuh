@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1464,14 +1464,13 @@ void extend(raft::resources const& handle,
   RAFT_EXPECTS(new_indices != nullptr || index->size() == 0,
                "You must pass data indices when the index is non-empty.");
 
-  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, uint8_t> ||
-                  std::is_same_v<T, int8_t>,
+  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, int8_t>,
                 "Unsupported data type");
 
   if (index->metric() == distance::DistanceType::CosineExpanded) {
-    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>)
+    if constexpr (std::is_same_v<T, int8_t>)
       RAFT_FAIL(
-        "CosineExpanded distance metric is currently not supported for uint8_t and int8_t data "
+        "CosineExpanded distance metric is currently not supported for int8_t data "
         "type");
   }
 
@@ -1689,17 +1688,16 @@ auto build(raft::resources const& handle,
   IdxT dim    = dataset.extent(1);
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
     "ivf_pq::build(%zu, %u)", size_t(n_rows), dim);
-  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, uint8_t> ||
-                  std::is_same_v<T, int8_t>,
+  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, int8_t>,
                 "Unsupported data type");
 
   RAFT_EXPECTS(n_rows > 0 && dim > 0, "empty dataset");
   RAFT_EXPECTS(n_rows >= params.n_lists, "number of rows can't be less than n_lists");
   if (params.metric == distance::DistanceType::CosineExpanded) {
-    // TODO: support int8_t and uint8_t types (https://github.com/rapidsai/cuvs/issues/389)
-    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>)
+    // TODO: support int8_t types (https://github.com/rapidsai/cuvs/issues/389)
+    if constexpr (std::is_same_v<T, int8_t>)
       RAFT_FAIL(
-        "CosineExpanded distance metric is currently not supported for uint8_t and int8_t data "
+        "CosineExpanded distance metric is currently not supported for int8_t data "
         "type");
   }
 

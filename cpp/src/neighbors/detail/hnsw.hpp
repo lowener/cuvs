@@ -56,11 +56,6 @@ struct hnsw_dist_t<half> {
 };
 
 template <>
-struct hnsw_dist_t<uint8_t> {
-  using type = int;
-};
-
-template <>
 struct hnsw_dist_t<int8_t> {
   using type = int;
 };
@@ -84,7 +79,7 @@ struct index_impl : index<T> {
     } else if (metric == cuvs::distance::DistanceType::L2Expanded) {
       if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
         space_ = std::make_unique<hnswlib::L2Space<T, typename hnsw_dist_t<T>::type>>(dim);
-      } else if constexpr (std::is_same_v<T, std::int8_t> or std::is_same_v<T, std::uint8_t>) {
+      } else if constexpr (std::is_same_v<T, std::int8_t>) {
         space_ = std::make_unique<hnswlib::L2SpaceI<T>>(dim);
       }
     }

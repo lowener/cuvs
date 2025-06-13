@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +24,14 @@ using f32_i08_i64_filter = ivf_pq_filter_test<float, int8_t, int64_t>;
 TEST_BUILD_SEARCH(f32_i08_i64)
 TEST_BUILD_HOST_INPUT_SEARCH(f32_i08_i64)
 TEST_BUILD_HOST_INPUT_OVERLAP_SEARCH(f32_i08_i64)
+TEST_BUILD_EXTEND_SEARCH(f32_i08_i64)
 TEST_BUILD_SERIALIZE_SEARCH(f32_i08_i64)
-INSTANTIATE(f32_i08_i64, defaults() + big_dims() + var_k() + enum_variety_l2() + enum_variety_ip());
+INSTANTIATE(f32_i08_i64,
+            defaults() + big_dims() + var_k() + enum_variety_l2() + enum_variety_ip() +
+              small_dims_per_cluster() + enum_variety() + enum_variety_l2sqrt());
 
 TEST_BUILD_SEARCH(f32_i08_i64_filter)
 INSTANTIATE(f32_i08_i64_filter,
-            defaults() + big_dims() + var_k() + enum_variety_l2() + enum_variety_ip());
+            defaults() + big_dims() + var_k() + enum_variety_l2() + enum_variety_ip() +
+              small_dims_per_cluster() + enum_variety() + enum_variety_l2sqrt());
 }  // namespace cuvs::neighbors::ivf_pq

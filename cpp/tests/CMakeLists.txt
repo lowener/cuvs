@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (c) 2021-2024, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -119,16 +119,8 @@ if(BUILD_TESTS)
   )
 
   ConfigureTest(
-    NAME
-    NEIGHBORS_ANN_IVF_PQ_TEST
-    PATH
-    neighbors/ann_ivf_pq/test_float_int64_t.cu
-    neighbors/ann_ivf_pq/test_int8_t_int64_t.cu
-    neighbors/ann_ivf_pq/test_uint8_t_int64_t.cu
-    GPUS
-    1
-    PERCENT
-    100
+    NAME NEIGHBORS_ANN_IVF_PQ_TEST PATH neighbors/ann_ivf_pq/test_float_int64_t.cu
+    neighbors/ann_ivf_pq/test_int8_t_int64_t.cu GPUS 1 PERCENT 100
   )
 
   ConfigureTest(
@@ -157,11 +149,6 @@ if(BUILD_TESTS)
   )
 
   ConfigureTest(
-    NAME NEIGHBORS_ANN_CAGRA_UINT8_UINT32_TEST PATH neighbors/ann_cagra/test_uint8_t_uint32_t.cu
-    GPUS 1 PERCENT 100
-  )
-
-  ConfigureTest(
     NAME
     NEIGHBORS_ANN_NN_DESCENT_TEST
     PATH
@@ -175,16 +162,8 @@ if(BUILD_TESTS)
   )
 
   ConfigureTest(
-    NAME
-    NEIGHBORS_ANN_VAMANA_TEST
-    PATH
-    neighbors/ann_vamana/test_float_uint32_t.cu
-    neighbors/ann_vamana/test_int8_t_uint32_t.cu
-    neighbors/ann_vamana/test_uint8_t_uint32_t.cu
-    GPUS
-    1
-    PERCENT
-    100
+    NAME NEIGHBORS_ANN_VAMANA_TEST PATH neighbors/ann_vamana/test_float_uint32_t.cu
+    neighbors/ann_vamana/test_int8_t_uint32_t.cu GPUS 1 PERCENT 100
   )
 
   ConfigureTest(NAME NEIGHBORS_BALL_COVER_TEST PATH neighbors/ball_cover.cu GPUS 1 PERCENT 100)

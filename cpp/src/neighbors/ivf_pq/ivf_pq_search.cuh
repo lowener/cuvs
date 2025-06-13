@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -810,13 +810,12 @@ inline void search(raft::resources const& handle,
                    float* distances,
                    IvfSampleFilterT sample_filter = IvfSampleFilterT())
 {
-  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, uint8_t> ||
-                  std::is_same_v<T, int8_t>,
+  static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, int8_t>,
                 "Unsupported element type.");
   if (index.metric() == distance::DistanceType::CosineExpanded) {
-    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>)
+    if constexpr (std::is_same_v<T, int8_t>)
       RAFT_FAIL(
-        "CosineExpanded distance metric is currently not supported for uint8_t and int8_t data "
+        "CosineExpanded distance metric is currently not supported for int8_t data "
         "type");
   }
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(

@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (c) 2020-2024, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -206,11 +206,10 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/cagra_search_float.cu
     src/neighbors/cagra_search_half.cu
     src/neighbors/cagra_search_int8.cu
-    src/neighbors/cagra_search_uint8.cu
     src/neighbors/detail/cagra/compute_distance.cu
-    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_u8_uint32_dim128_t8.cu
-    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_u8_uint32_dim256_t16.cu
-    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_u8_uint32_dim512_t32.cu
+    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_i8_uint32_dim128_t8.cu
+    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_i8_uint32_dim256_t16.cu
+    src/neighbors/detail/cagra/compute_distance_standard_BitwiseHamming_i8_uint32_dim512_t32.cu
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_float_uint32_dim128_t8.cu
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_float_uint32_dim256_t16.cu
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_float_uint32_dim512_t32.cu
@@ -220,9 +219,6 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_int8_uint32_dim128_t8.cu
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_int8_uint32_dim256_t16.cu
     src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_int8_uint32_dim512_t32.cu
-    src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_uint8_uint32_dim128_t8.cu
-    src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_uint8_uint32_dim256_t16.cu
-    src/neighbors/detail/cagra/compute_distance_standard_InnerProduct_uint8_uint32_dim512_t32.cu
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_float_uint32_dim128_t8.cu
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_float_uint32_dim256_t16.cu
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_float_uint32_dim512_t32.cu
@@ -232,9 +228,6 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_int8_uint32_dim128_t8.cu
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_int8_uint32_dim256_t16.cu
     src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_int8_uint32_dim512_t32.cu
-    src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim128_t8.cu
-    src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim256_t16.cu
-    src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim512_t32.cu
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_float_uint32_dim128_t8_8pq_2subd_half.cu
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_float_uint32_dim128_t8_8pq_4subd_half.cu
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_float_uint32_dim256_t16_8pq_2subd_half.cu
@@ -253,20 +246,12 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_int8_uint32_dim256_t16_8pq_4subd_half.cu
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_int8_uint32_dim512_t32_8pq_2subd_half.cu
     src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_int8_uint32_dim512_t32_8pq_4subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim128_t8_8pq_2subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim128_t8_8pq_4subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim256_t16_8pq_2subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim256_t16_8pq_4subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim512_t32_8pq_2subd_half.cu
-    src/neighbors/detail/cagra/compute_distance_vpq_L2Expanded_uint8_uint32_dim512_t32_8pq_4subd_half.cu
     src/neighbors/detail/cagra/search_multi_cta_float_uint32.cu
     src/neighbors/detail/cagra/search_multi_cta_half_uint32.cu
     src/neighbors/detail/cagra/search_multi_cta_int8_uint32.cu
-    src/neighbors/detail/cagra/search_multi_cta_uint8_uint32.cu
     src/neighbors/detail/cagra/search_single_cta_float_uint32.cu
     src/neighbors/detail/cagra/search_single_cta_half_uint32.cu
     src/neighbors/detail/cagra/search_single_cta_int8_uint32.cu
-    src/neighbors/detail/cagra/search_single_cta_uint8_uint32.cu
   )
 
   file(GLOB_RECURSE compute_distance_sources "src/neighbors/detail/cagra/compute_distance_*.cu")
@@ -296,15 +281,12 @@ if(BUILD_SHARED_LIBS)
     set(CUVS_MG_ALGOS
         src/neighbors/mg/mg_flat_float_int64_t.cu
         src/neighbors/mg/mg_flat_int8_t_int64_t.cu
-        src/neighbors/mg/mg_flat_uint8_t_int64_t.cu
         src/neighbors/mg/mg_pq_float_int64_t.cu
         src/neighbors/mg/mg_pq_half_int64_t.cu
         src/neighbors/mg/mg_pq_int8_t_int64_t.cu
-        src/neighbors/mg/mg_pq_uint8_t_int64_t.cu
         src/neighbors/mg/mg_cagra_float_uint32_t.cu
         src/neighbors/mg/mg_cagra_half_uint32_t.cu
         src/neighbors/mg/mg_cagra_int8_t_uint32_t.cu
-        src/neighbors/mg/mg_cagra_uint8_t_uint32_t.cu
         src/neighbors/mg/omp_checks.cpp
     )
   endif()
@@ -392,30 +374,23 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/cagra_build_float.cu
     src/neighbors/cagra_build_half.cu
     src/neighbors/cagra_build_int8.cu
-    src/neighbors/cagra_build_uint8.cu
     src/neighbors/cagra_extend_float.cu
     src/neighbors/cagra_extend_int8.cu
-    src/neighbors/cagra_extend_uint8.cu
     src/neighbors/cagra_optimize.cu
     src/neighbors/cagra_serialize_float.cu
     src/neighbors/cagra_serialize_half.cu
     src/neighbors/cagra_serialize_int8.cu
-    src/neighbors/cagra_serialize_uint8.cu
     src/neighbors/cagra_merge_float.cu
     src/neighbors/cagra_merge_half.cu
     src/neighbors/cagra_merge_int8.cu
-    src/neighbors/cagra_merge_uint8.cu
     src/neighbors/iface/iface_cagra_float_uint32_t.cu
     src/neighbors/iface/iface_cagra_half_uint32_t.cu
     src/neighbors/iface/iface_cagra_int8_t_uint32_t.cu
-    src/neighbors/iface/iface_cagra_uint8_t_uint32_t.cu
     src/neighbors/iface/iface_flat_float_int64_t.cu
     src/neighbors/iface/iface_flat_int8_t_int64_t.cu
-    src/neighbors/iface/iface_flat_uint8_t_int64_t.cu
     src/neighbors/iface/iface_pq_float_int64_t.cu
     src/neighbors/iface/iface_pq_half_int64_t.cu
     src/neighbors/iface/iface_pq_int8_t_int64_t.cu
-    src/neighbors/iface/iface_pq_uint8_t_int64_t.cu
     src/neighbors/detail/cagra/cagra_build.cpp
     src/neighbors/detail/cagra/topk_for_cagra/topk.cu
     src/neighbors/dynamic_batching.cu
@@ -444,7 +419,6 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/ivf_pq/detail/ivf_pq_build_extend_float_int64_t.cu
     src/neighbors/ivf_pq/detail/ivf_pq_build_extend_half_int64_t.cu
     src/neighbors/ivf_pq/detail/ivf_pq_build_extend_int8_t_int64_t.cu
-    src/neighbors/ivf_pq/detail/ivf_pq_build_extend_uint8_t_int64_t.cu
     src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_half_fp8_false.cu
     src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_half_fp8_true.cu
     src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_half_half.cu
@@ -462,7 +436,6 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/ivf_pq/detail/ivf_pq_search_float_int64_t.cu
     src/neighbors/ivf_pq/detail/ivf_pq_search_half_int64_t.cu
     src/neighbors/ivf_pq/detail/ivf_pq_search_int8_t_int64_t.cu
-    src/neighbors/ivf_pq/detail/ivf_pq_search_uint8_t_int64_t.cu
     src/neighbors/knn_merge_parts.cu
     src/neighbors/nn_descent.cu
     src/neighbors/nn_descent_float.cu
@@ -483,10 +456,8 @@ if(BUILD_SHARED_LIBS)
     src/neighbors/tiered_index.cu
     src/neighbors/sparse_brute_force.cu
     src/neighbors/vamana_build_float.cu
-    src/neighbors/vamana_build_uint8.cu
     src/neighbors/vamana_build_int8.cu
     src/neighbors/vamana_serialize_float.cu
-    src/neighbors/vamana_serialize_uint8.cu
     src/neighbors/vamana_serialize_int8.cu
     src/preprocessing/quantize/scalar.cu
     src/preprocessing/quantize/binary.cu

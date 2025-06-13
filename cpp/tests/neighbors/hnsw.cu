@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -196,10 +196,5 @@ typedef AnnHNSWTest<float, int8_t, uint64_t> AnnHNSW_I8;
 TEST_P(AnnHNSW_I8, AnnHNSW) { this->testHNSW(); }
 
 INSTANTIATE_TEST_CASE_P(AnnHNSWTest, AnnHNSW_I8, ::testing::ValuesIn(inputs));
-
-typedef AnnHNSWTest<float, uint8_t, uint64_t> AnnHNSW_U8;
-TEST_P(AnnHNSW_U8, AnnHNSW) { this->testHNSW(); }
-
-INSTANTIATE_TEST_CASE_P(AnnHNSWTest, AnnHNSW_U8, ::testing::ValuesIn(inputs));
 
 }  // namespace cuvs::neighbors::hnsw

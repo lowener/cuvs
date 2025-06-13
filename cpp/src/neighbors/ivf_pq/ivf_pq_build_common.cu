@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -137,14 +137,6 @@ void reconstruct_list_data(raft::resources const& res,
 {
   detail::reconstruct_list_data<int8_t, int64_t>(res, index, out_vectors, label, offset);
 }
-void reconstruct_list_data(raft::resources const& res,
-                           const index<int64_t>& index,
-                           raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
-                           uint32_t label,
-                           uint32_t offset)
-{
-  detail::reconstruct_list_data<uint8_t, int64_t>(res, index, out_vectors, label, offset);
-}
 
 void reconstruct_list_data(raft::resources const& res,
                            const index<int64_t>& index,
@@ -162,15 +154,6 @@ void reconstruct_list_data(raft::resources const& res,
                            uint32_t label)
 {
   detail::reconstruct_list_data<int8_t, int64_t>(
-    res, index, out_vectors, label, in_cluster_indices.data_handle());
-}
-void reconstruct_list_data(raft::resources const& res,
-                           const index<int64_t>& index,
-                           raft::device_vector_view<const uint32_t> in_cluster_indices,
-                           raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
-                           uint32_t label)
-{
-  detail::reconstruct_list_data<uint8_t, int64_t>(
     res, index, out_vectors, label, in_cluster_indices.data_handle());
 }
 
@@ -200,15 +183,6 @@ void extend_list(raft::resources const& res,
 {
   detail::extend_list<int8_t, int64_t>(res, index, new_vectors, new_indices, label);
 }
-void extend_list(raft::resources const& res,
-                 index<int64_t>* index,
-                 raft::device_matrix_view<const uint8_t, uint32_t, raft::row_major> new_vectors,
-                 raft::device_vector_view<const int64_t, uint32_t, raft::row_major> new_indices,
-                 uint32_t label)
-{
-  detail::extend_list<uint8_t, int64_t>(res, index, new_vectors, new_indices, label);
-}
-
 };  // namespace codepacker
 
 void erase_list(raft::resources const& res, index<int64_t>* index, uint32_t label)
