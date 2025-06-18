@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -248,14 +248,6 @@ void search(raft::resources const& res,
 /** @copydoc search */
 void search(raft::resources const& res,
             cuvs::neighbors::dynamic_batching::search_params const& params,
-            dynamic_batching::index<uint8_t, uint32_t> const& index,
-            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
-            raft::device_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
-            raft::device_matrix_view<float, int64_t, raft::row_major> distances);
-
-/** @copydoc search */
-void search(raft::resources const& res,
-            cuvs::neighbors::dynamic_batching::search_params const& params,
             dynamic_batching::index<float, int64_t> const& index,
             raft::device_matrix_view<const float, int64_t, raft::row_major> queries,
             raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
@@ -274,14 +266,6 @@ void search(raft::resources const& res,
             cuvs::neighbors::dynamic_batching::search_params const& params,
             dynamic_batching::index<int8_t, int64_t> const& index,
             raft::device_matrix_view<const int8_t, int64_t, raft::row_major> queries,
-            raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
-            raft::device_matrix_view<float, int64_t, raft::row_major> distances);
-
-/** @copydoc search */
-void search(raft::resources const& res,
-            cuvs::neighbors::dynamic_batching::search_params const& params,
-            dynamic_batching::index<uint8_t, int64_t> const& index,
-            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
             raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances);
 

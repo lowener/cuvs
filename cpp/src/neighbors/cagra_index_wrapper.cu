@@ -100,11 +100,9 @@ IndexWrapper<T, IdxT, OutputIdxT>::merge(
 template class IndexWrapper<float, uint32_t, uint32_t>;
 template class IndexWrapper<half, uint32_t, uint32_t>;
 template class IndexWrapper<int8_t, uint32_t, uint32_t>;
-template class IndexWrapper<uint8_t, uint32_t, uint32_t>;
 
 template class IndexWrapper<float, uint32_t, int64_t>;
 template class IndexWrapper<half, uint32_t, int64_t>;
 template class IndexWrapper<int8_t, uint32_t, int64_t>;
-template class IndexWrapper<uint8_t, uint32_t, int64_t>;
 
 }  // namespace cuvs::neighbors::cagra

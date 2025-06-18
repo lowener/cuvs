@@ -62,8 +62,10 @@ RAFT_KERNEL naive_distance_kernel(EvalT* dist,
           acc += diff * diff;
         } break;
         case cuvs::distance::DistanceType::BitwiseHamming: {
-          if constexpr (std::is_same_v<uint8_t, DataT> || std::is_same_v<int8_t, DataT>) {
-            acc += __popc(static_cast<uint32_t>(xv ^ yv) & 0xff);
+          if constexpr (std::is_same_v<uint8_t, DataT>) {
+            acc += __popc(static_cast<uint32_t>(xv ^ yv) & 0xffu);
+          } else if constexpr (std::is_same_v<int8_t, DataT>) {
+            acc += __popc(static_cast<uint32_t>((uint8_t)xv ^ (uint8_t)yv) & 0xffu);
           }
         } break;
         default: break;

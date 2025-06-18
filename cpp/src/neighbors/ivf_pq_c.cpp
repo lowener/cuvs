@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -203,9 +203,6 @@ extern "C" cuvsError_t cuvsIvfPqBuild(cuvsResources_t res,
     } else if (dataset.dtype.code == kDLInt && dataset.dtype.bits == 8) {
       index->addr =
         reinterpret_cast<uintptr_t>(_build<int8_t, int64_t>(res, *params, dataset_tensor));
-    } else if (dataset.dtype.code == kDLUInt && dataset.dtype.bits == 8) {
-      index->addr =
-        reinterpret_cast<uintptr_t>(_build<uint8_t, int64_t>(res, *params, dataset_tensor));
     } else {
       RAFT_FAIL("Unsupported dataset DLtensor dtype: %d and bits: %d",
                 dataset.dtype.code,
@@ -247,9 +244,6 @@ extern "C" cuvsError_t cuvsIvfPqSearch(cuvsResources_t res,
         res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
     } else if (queries.dtype.code == kDLInt && queries.dtype.bits == 8) {
       _search<int8_t, int64_t>(
-        res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
-    } else if (queries.dtype.code == kDLUInt && queries.dtype.bits == 8) {
-      _search<uint8_t, int64_t>(
         res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
     } else {
       RAFT_FAIL("Unsupported queries DLtensor dtype: %d and bits: %d",
@@ -328,8 +322,6 @@ extern "C" cuvsError_t cuvsIvfPqExtend(cuvsResources_t res,
       _extend<half, int64_t>(res, new_vectors, new_indices, *index);
     } else if (vectors.dtype.code == kDLInt && vectors.dtype.bits == 8) {
       _extend<int8_t, int64_t>(res, new_vectors, new_indices, *index);
-    } else if (vectors.dtype.code == kDLUInt && vectors.dtype.bits == 8) {
-      _extend<uint8_t, int64_t>(res, new_vectors, new_indices, *index);
     } else {
       RAFT_FAIL("Unsupported index dtype: %d and bits: %d", vectors.dtype.code, vectors.dtype.bits);
     }

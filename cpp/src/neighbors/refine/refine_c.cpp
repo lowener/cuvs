@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -128,15 +128,6 @@ extern "C" cuvsError_t cuvsRefine(cuvsResources_t res,
                       metric,
                       indices_tensor,
                       distances_tensor);
-    } else if (queries.dtype.code == kDLUInt && queries.dtype.bits == 8) {
-      _refine<uint8_t>(on_device,
-                       res,
-                       dataset_tensor,
-                       queries_tensor,
-                       candidates_tensor,
-                       metric,
-                       indices_tensor,
-                       distances_tensor);
     } else {
       RAFT_FAIL("Unsupported queries DLtensor dtype: %d and bits: %d",
                 queries.dtype.code,
