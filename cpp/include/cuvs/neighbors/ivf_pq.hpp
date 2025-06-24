@@ -702,9 +702,9 @@ void build(raft::resources const& handle,
  *
  * @return the constructed ivf-pq index
  */
-auto build(raft::resources const& handle,
-           const cuvs::neighbors::ivf_pq::index_params& index_params,
-           raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> dataset)
+[[deprecated]] auto build(raft::resources const& handle,
+                          const cuvs::neighbors::ivf_pq::index_params& index_params,
+                          raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> dataset)
   -> cuvs::neighbors::ivf_pq::index<int64_t>;
 
 /**
@@ -726,10 +726,10 @@ auto build(raft::resources const& handle,
  * @param[out] idx reference to ivf_pq::index
  *
  */
-void build(raft::resources const& handle,
-           const cuvs::neighbors::ivf_pq::index_params& index_params,
-           raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_pq::index<int64_t>* idx);
+[[deprecated]] void build(raft::resources const& handle,
+                          const cuvs::neighbors::ivf_pq::index_params& index_params,
+                          raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> dataset,
+                          cuvs::neighbors::ivf_pq::index<int64_t>* idx);
 /**
  * @brief Build the index from the dataset for efficient search.
  *
@@ -924,9 +924,9 @@ void build(raft::resources const& handle,
  *
  * @return the constructed ivf-pq index
  */
-auto build(raft::resources const& handle,
-           const cuvs::neighbors::ivf_pq::index_params& index_params,
-           raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> dataset)
+[[deprecated]] auto build(raft::resources const& handle,
+                          const cuvs::neighbors::ivf_pq::index_params& index_params,
+                          raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> dataset)
   -> cuvs::neighbors::ivf_pq::index<int64_t>;
 
 /**
@@ -955,10 +955,10 @@ auto build(raft::resources const& handle,
  * @param[out] idx reference to ivf_pq::index
  *
  */
-void build(raft::resources const& handle,
-           const cuvs::neighbors::ivf_pq::index_params& index_params,
-           raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_pq::index<int64_t>* idx);
+[[deprecated]] void build(raft::resources const& handle,
+                          const cuvs::neighbors::ivf_pq::index_params& index_params,
+                          raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> dataset,
+                          cuvs::neighbors::ivf_pq::index<int64_t>* idx);
 /**
  * @}
  */
@@ -1160,11 +1160,11 @@ void extend(raft::resources const& handle,
  *    here to imply a continuous range `[0...n_rows)`.
  * @param[inout] idx
  */
-auto extend(raft::resources const& handle,
-            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
-            std::optional<raft::device_vector_view<const int64_t, int64_t>> new_indices,
-            const cuvs::neighbors::ivf_pq::index<int64_t>& idx)
-  -> cuvs::neighbors::ivf_pq::index<int64_t>;
+[[deprecated]] auto extend(
+  raft::resources const& handle,
+  raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
+  std::optional<raft::device_vector_view<const int64_t, int64_t>> new_indices,
+  const cuvs::neighbors::ivf_pq::index<int64_t>& idx) -> cuvs::neighbors::ivf_pq::index<int64_t>;
 
 /**
  * @brief Extend the index with the new data.
@@ -1189,10 +1189,11 @@ auto extend(raft::resources const& handle,
  *    here to imply a continuous range `[0...n_rows)`.
  * @param[inout] idx
  */
-void extend(raft::resources const& handle,
-            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
-            std::optional<raft::device_vector_view<const int64_t, int64_t>> new_indices,
-            cuvs::neighbors::ivf_pq::index<int64_t>* idx);
+[[deprecated]] void extend(
+  raft::resources const& handle,
+  raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
+  std::optional<raft::device_vector_view<const int64_t, int64_t>> new_indices,
+  cuvs::neighbors::ivf_pq::index<int64_t>* idx);
 
 /**
  * @brief Extend the index with the new data.
@@ -1430,11 +1431,11 @@ void extend(raft::resources const& handle,
  *    here to imply a continuous range `[0...n_rows)`.
  * @param[inout] idx
  */
-auto extend(raft::resources const& handle,
-            raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
-            std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices,
-            const cuvs::neighbors::ivf_pq::index<int64_t>& idx)
-  -> cuvs::neighbors::ivf_pq::index<int64_t>;
+[[deprecated]] auto extend(
+  raft::resources const& handle,
+  raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
+  std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices,
+  const cuvs::neighbors::ivf_pq::index<int64_t>& idx) -> cuvs::neighbors::ivf_pq::index<int64_t>;
 
 /**
  * @brief Extend the index with the new data.
@@ -1466,10 +1467,11 @@ auto extend(raft::resources const& handle,
  *    here to imply a continuous range `[0...n_rows)`.
  * @param[inout] idx
  */
-void extend(raft::resources const& handle,
-            raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
-            std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices,
-            cuvs::neighbors::ivf_pq::index<int64_t>* idx);
+[[deprecated]] void extend(
+  raft::resources const& handle,
+  raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> new_vectors,
+  std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices,
+  cuvs::neighbors::ivf_pq::index<int64_t>* idx);
 /**
  * @}
  */
@@ -1649,14 +1651,15 @@ void search(raft::resources const& handle,
  * @param[in] sample_filter an optional device filter function object that greenlights samples
  * for a given query. (none_sample_filter for no filtering)
  */
-void search(raft::resources const& handle,
-            const cuvs::neighbors::ivf_pq::search_params& search_params,
-            const cuvs::neighbors::ivf_pq::index<int64_t>& index,
-            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
-            raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
-            raft::device_matrix_view<float, int64_t, raft::row_major> distances,
-            const cuvs::neighbors::filtering::base_filter& sample_filter =
-              cuvs::neighbors::filtering::none_sample_filter{});
+[[deprecated]] void search(
+  raft::resources const& handle,
+  const cuvs::neighbors::ivf_pq::search_params& search_params,
+  const cuvs::neighbors::ivf_pq::index<int64_t>& index,
+  raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
+  raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
+  raft::device_matrix_view<float, int64_t, raft::row_major> distances,
+  const cuvs::neighbors::filtering::base_filter& sample_filter =
+    cuvs::neighbors::filtering::none_sample_filter{});
 
 /**
  * @}
@@ -1835,6 +1838,29 @@ auto build(const raft::resources& clique,
            raft::host_matrix_view<const int8_t, int64_t, row_major> index_dataset)
   -> cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, int8_t, int64_t>;
 
+/// \ingroup mg_cpp_index_build
+/**
+ * @brief Builds a multi-GPU index
+ *
+ * Usage example:
+ * @code{.cpp}
+ * raft::device_resources_snmg clique;
+ * cuvs::neighbors::mg_index_params<ivf_pq::index_params> index_params;
+ * auto index = cuvs::neighbors::ivf_pq::build(clique, index_params, index_dataset);
+ * @endcode
+ *
+ * @param[in] clique a `raft::resources` object specifying the NCCL clique configuration
+ * @param[in] index_params configure the index building
+ * @param[in] index_dataset a row-major matrix on host [n_rows, dim]
+ *
+ * @return the constructed IVF-PQ MG index
+ */
+[[deprecated]] auto build(
+  const raft::resources& clique,
+  const cuvs::neighbors::mg_index_params<ivf_pq::index_params>& index_params,
+  raft::host_matrix_view<const uint8_t, int64_t, row_major> index_dataset)
+  -> cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, uint8_t, int64_t>;
+
 /// \defgroup mg_cpp_index_extend ANN MG index extend
 
 /// \ingroup mg_cpp_index_extend
@@ -1908,6 +1934,31 @@ void extend(const raft::resources& clique,
             cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, int8_t, int64_t>& index,
             raft::host_matrix_view<const int8_t, int64_t, row_major> new_vectors,
             std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices);
+
+/// \ingroup mg_cpp_index_extend
+/**
+ * @brief Extends a multi-GPU index
+ *
+ * Usage example:
+ * @code{.cpp}
+ * raft::device_resources_snmg clique;
+ * cuvs::neighbors::mg_index_params<ivf_pq::index_params> index_params;
+ * auto index = cuvs::neighbors::ivf_pq::build(clique, index_params, index_dataset);
+ * cuvs::neighbors::ivf_pq::extend(clique, index, new_vectors, std::nullopt);
+ * @endcode
+ *
+ * @param[in] clique a `raft::resources` object specifying the NCCL clique configuration
+ * @param[in] index the pre-built index
+ * @param[in] new_vectors a row-major matrix on host [n_rows, dim]
+ * @param[in] new_indices optional vector on host [n_rows],
+ * `std::nullopt` means default continuous range `[0...n_rows)`
+ *
+ */
+[[deprecated]] void extend(
+  const raft::resources& clique,
+  cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, uint8_t, int64_t>& index,
+  raft::host_matrix_view<const uint8_t, int64_t, row_major> new_vectors,
+  std::optional<raft::host_vector_view<const int64_t, int64_t>> new_indices);
 
 /// \defgroup mg_cpp_index_search ANN MG index search
 
@@ -1998,6 +2049,36 @@ void search(const raft::resources& clique,
             raft::host_matrix_view<int64_t, int64_t, row_major> neighbors,
             raft::host_matrix_view<float, int64_t, row_major> distances);
 
+/// \ingroup mg_cpp_index_search
+/**
+ * @brief Searches a multi-GPU index
+ *
+ * Usage example:
+ * @code{.cpp}
+ * raft::device_resources_snmg clique;
+ * cuvs::neighbors::mg_index_params<ivf_pq::index_params> index_params;
+ * auto index = cuvs::neighbors::ivf_pq::build(clique, index_params, index_dataset);
+ * cuvs::neighbors::mg_search_params<ivf_pq::search_params> search_params;
+ * cuvs::neighbors::ivf_pq::search(clique, index, search_params, queries, neighbors,
+ * distances);
+ * @endcode
+ *
+ * @param[in] clique a `raft::resources` object specifying the NCCL clique configuration
+ * @param[in] index the pre-built index
+ * @param[in] search_params configure the index search
+ * @param[in] queries a row-major matrix on host [n_rows, dim]
+ * @param[out] neighbors a row-major matrix on host [n_rows, n_neighbors]
+ * @param[out] distances a row-major matrix on host [n_rows, n_neighbors]
+ *
+ */
+[[deprecated]] void search(
+  const raft::resources& clique,
+  const cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, uint8_t, int64_t>& index,
+  const cuvs::neighbors::mg_search_params<ivf_pq::search_params>& search_params,
+  raft::host_matrix_view<const uint8_t, int64_t, row_major> queries,
+  raft::host_matrix_view<int64_t, int64_t, row_major> neighbors,
+  raft::host_matrix_view<float, int64_t, row_major> distances);
+
 /// \defgroup mg_cpp_serialize ANN MG index serialization
 
 /// \ingroup mg_cpp_serialize
@@ -2065,6 +2146,29 @@ void serialize(const raft::resources& clique,
 void serialize(const raft::resources& clique,
                const cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, int8_t, int64_t>& index,
                const std::string& filename);
+
+/// \ingroup mg_cpp_serialize
+/**
+ * @brief Serializes a multi-GPU index
+ *
+ * Usage example:
+ * @code{.cpp}
+ * raft::device_resources_snmg clique;
+ * cuvs::neighbors::mg_index_params<ivf_pq::index_params> index_params;
+ * auto index = cuvs::neighbors::ivf_pq::build(clique, index_params, index_dataset);
+ * const std::string filename = "mg_index.cuvs";
+ * cuvs::neighbors::ivf_pq::serialize(clique, index, filename);
+ * @endcode
+ *
+ * @param[in] clique a `raft::resources` object specifying the NCCL clique configuration
+ * @param[in] index the pre-built index
+ * @param[in] filename path to the file to be serialized
+ *
+ */
+[[deprecated]] void serialize(
+  const raft::resources& clique,
+  const cuvs::neighbors::mg_index<ivf_pq::index<int64_t>, uint8_t, int64_t>& index,
+  const std::string& filename);
 
 /// \ingroup mg_cpp_deserialize
 /**
@@ -2503,11 +2607,12 @@ void reconstruct_list_data(raft::resources const& res,
                            uint32_t label,
                            uint32_t offset);
 
-void reconstruct_list_data(raft::resources const& res,
-                           const index<int64_t>& index,
-                           raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
-                           uint32_t label,
-                           uint32_t offset);
+[[deprecated]] void reconstruct_list_data(
+  raft::resources const& res,
+  const index<int64_t>& index,
+  raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
+  uint32_t label,
+  uint32_t offset);
 
 /**
  * @brief Decode a series of records of a single list (cluster) in the compressed index
@@ -2555,11 +2660,12 @@ void reconstruct_list_data(raft::resources const& res,
                            raft::device_vector_view<const uint32_t> in_cluster_indices,
                            raft::device_matrix_view<int8_t, uint32_t, raft::row_major> out_vectors,
                            uint32_t label);
-void reconstruct_list_data(raft::resources const& res,
-                           const index<int64_t>& index,
-                           raft::device_vector_view<const uint32_t> in_cluster_indices,
-                           raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
-                           uint32_t label);
+[[deprecated]] void reconstruct_list_data(
+  raft::resources const& res,
+  const index<int64_t>& index,
+  raft::device_vector_view<const uint32_t> in_cluster_indices,
+  raft::device_matrix_view<uint8_t, uint32_t, raft::row_major> out_vectors,
+  uint32_t label);
 
 /**
  * @brief Extend one list of the index in-place, by the list label, skipping the classification and
@@ -2633,11 +2739,12 @@ void extend_list(raft::resources const& res,
                  raft::device_matrix_view<const int8_t, uint32_t, raft::row_major> new_vectors,
                  raft::device_vector_view<const int64_t, uint32_t, raft::row_major> new_indices,
                  uint32_t label);
-void extend_list(raft::resources const& res,
-                 index<int64_t>* index,
-                 raft::device_matrix_view<const uint8_t, uint32_t, raft::row_major> new_vectors,
-                 raft::device_vector_view<const int64_t, uint32_t, raft::row_major> new_indices,
-                 uint32_t label);
+[[deprecated]] void extend_list(
+  raft::resources const& res,
+  index<int64_t>* index,
+  raft::device_matrix_view<const uint8_t, uint32_t, raft::row_major> new_vectors,
+  raft::device_vector_view<const int64_t, uint32_t, raft::row_major> new_indices,
+  uint32_t label);
 
 /**
  * @}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,9 +28,9 @@ using cagra_F32 = dynamic_batching_test<float,
                                         cagra::build,
                                         cagra::search>;
 
-using cagra_I8 = dynamic_batching_test<int8_t,
+using cagra_U8 = dynamic_batching_test<uint8_t,
                                        uint32_t,
-                                       cagra::index<int8_t, uint32_t>,
+                                       cagra::index<uint8_t, uint32_t>,
                                        cagra::build,
                                        cagra::search>;
 
@@ -70,7 +70,7 @@ TEST_P(cagra_F32, multi_kernel)
   check_neighbors();
 }
 
-TEST_P(cagra_I8, defaults)
+TEST_P(cagra_U8, defaults)
 {
   set_default_cagra_params(*this);
   build_all();
@@ -79,6 +79,6 @@ TEST_P(cagra_I8, defaults)
 }
 
 INSTANTIATE_TEST_CASE_P(dynamic_batching, cagra_F32, ::testing::ValuesIn(inputs));
-INSTANTIATE_TEST_CASE_P(dynamic_batching, cagra_I8, ::testing::ValuesIn(inputs));
+INSTANTIATE_TEST_CASE_P(dynamic_batching, cagra_U8, ::testing::ValuesIn(inputs));
 
 }  // namespace cuvs::neighbors::dynamic_batching

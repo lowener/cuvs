@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -157,6 +157,9 @@ extern "C" cuvsError_t cuvsHnswIndexDestroy(cuvsHnswIndex_t index_c_ptr)
     } else if (index.dtype.code == kDLInt) {
       auto index_ptr = reinterpret_cast<cuvs::neighbors::hnsw::index<int8_t>*>(index.addr);
       delete index_ptr;
+    } else if (index.dtype.code == kDLUInt) {
+      auto index_ptr = reinterpret_cast<cuvs::neighbors::hnsw::index<uint8_t>*>(index.addr);
+      delete index_ptr;
     }
     delete index_c_ptr;
   });
@@ -185,6 +188,8 @@ extern "C" cuvsError_t cuvsHnswFromCagra(cuvsResources_t res,
       _from_cagra<float>(res, params, cagra_index, hnsw_index, std::nullopt);
     } else if (index.dtype.code == kDLFloat && index.dtype.bits == 16) {
       _from_cagra<half>(res, params, cagra_index, hnsw_index, std::nullopt);
+    } else if (index.dtype.code == kDLUInt) {
+      _from_cagra<uint8_t>(res, params, cagra_index, hnsw_index, std::nullopt);
     } else if (index.dtype.code == kDLInt) {
       _from_cagra<int8_t>(res, params, cagra_index, hnsw_index, std::nullopt);
     } else {
@@ -206,6 +211,8 @@ extern "C" cuvsError_t cuvsHnswFromCagraWithDataset(cuvsResources_t res,
       _from_cagra<float>(res, params, cagra_index, hnsw_index, dataset_tensor);
     } else if (index.dtype.code == kDLFloat && index.dtype.bits == 16) {
       _from_cagra<half>(res, params, cagra_index, hnsw_index, dataset_tensor);
+    } else if (index.dtype.code == kDLUInt) {
+      _from_cagra<uint8_t>(res, params, cagra_index, hnsw_index, dataset_tensor);
     } else if (index.dtype.code == kDLInt) {
       _from_cagra<int8_t>(res, params, cagra_index, hnsw_index, dataset_tensor);
     } else {
@@ -224,6 +231,8 @@ extern "C" cuvsError_t cuvsHnswExtend(cuvsResources_t res,
       _extend<float>(res, params, additional_dataset, *index);
     } else if (index->dtype.code == kDLFloat && index->dtype.bits == 16) {
       _extend<half>(res, params, additional_dataset, *index);
+    } else if (index->dtype.code == kDLUInt) {
+      _extend<uint8_t>(res, params, additional_dataset, *index);
     } else if (index->dtype.code == kDLInt) {
       _extend<int8_t>(res, params, additional_dataset, *index);
     } else {
@@ -274,6 +283,8 @@ extern "C" cuvsError_t cuvsHnswSearch(cuvsResources_t res,
       _search<float>(res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
     } else if (index.dtype.code == kDLFloat && index.dtype.bits == 16) {
       _search<half>(res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
+    } else if (index.dtype.code == kDLUInt) {
+      _search<uint8_t>(res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
     } else if (index.dtype.code == kDLInt) {
       _search<int8_t>(res, *params, index, queries_tensor, neighbors_tensor, distances_tensor);
     } else {
@@ -293,6 +304,8 @@ extern "C" cuvsError_t cuvsHnswSerialize(cuvsResources_t res,
       _serialize<half>(res, filename, *index);
     } else if (index->dtype.code == kDLInt) {
       _serialize<int8_t>(res, filename, *index);
+    } else if (index->dtype.code == kDLUInt) {
+      _serialize<uint8_t>(res, filename, *index);
     } else {
       RAFT_FAIL("Unsupported index dtype: %d and bits: %d", index->dtype.code, index->dtype.bits);
     }
@@ -313,6 +326,9 @@ extern "C" cuvsError_t cuvsHnswDeserialize(cuvsResources_t res,
     } else if (index->dtype.code == kDLFloat && index->dtype.bits == 16) {
       index->addr =
         reinterpret_cast<uintptr_t>(_deserialize<half>(res, params, filename, dim, metric));
+    } else if (index->dtype.code == kDLUInt && index->dtype.bits == 8) {
+      index->addr =
+        reinterpret_cast<uintptr_t>(_deserialize<uint8_t>(res, params, filename, dim, metric));
     } else if (index->dtype.code == kDLInt && index->dtype.bits == 8) {
       index->addr =
         reinterpret_cast<uintptr_t>(_deserialize<int8_t>(res, params, filename, dim, metric));

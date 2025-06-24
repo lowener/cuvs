@@ -165,6 +165,9 @@ extern "C" cuvsError_t cuvsNNDescentBuild(cuvsResources_t res,
     } else if ((dtype.code == kDLInt) && (dtype.bits == 8)) {
       index->addr = reinterpret_cast<uintptr_t>(
         _build<int8_t, uint32_t>(res, *params, dataset_tensor, graph_tensor));
+    } else if ((dtype.code == kDLUInt) && (dtype.bits == 8)) {
+      index->addr = reinterpret_cast<uintptr_t>(
+        _build<uint8_t, uint32_t>(res, *params, dataset_tensor, graph_tensor));
     } else {
       RAFT_FAIL("Unsupported nn-descent dataset dtype: %d and bits: %d", dtype.code, dtype.bits);
     }

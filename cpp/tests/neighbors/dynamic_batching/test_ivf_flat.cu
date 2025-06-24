@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@
 
 namespace cuvs::neighbors::dynamic_batching {
 
-using ivf_flat_i8 = dynamic_batching_test<int8_t,
+using ivf_flat_i8 = dynamic_batching_test<uint8_t,
                                           int64_t,
-                                          ivf_flat::index<int8_t, int64_t>,
+                                          ivf_flat::index<uint8_t, int64_t>,
                                           ivf_flat::build,
                                           ivf_flat::search>;
 

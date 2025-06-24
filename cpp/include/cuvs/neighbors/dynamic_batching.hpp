@@ -246,6 +246,15 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances);
 
 /** @copydoc search */
+[[deprecated]] void search(
+  raft::resources const& res,
+  cuvs::neighbors::dynamic_batching::search_params const& params,
+  dynamic_batching::index<uint8_t, uint32_t> const& index,
+  raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
+  raft::device_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+  raft::device_matrix_view<float, int64_t, raft::row_major> distances);
+
+/** @copydoc search */
 void search(raft::resources const& res,
             cuvs::neighbors::dynamic_batching::search_params const& params,
             dynamic_batching::index<float, int64_t> const& index,
@@ -268,6 +277,15 @@ void search(raft::resources const& res,
             raft::device_matrix_view<const int8_t, int64_t, raft::row_major> queries,
             raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances);
+
+/** @copydoc search */
+[[deprecated]] void search(
+  raft::resources const& res,
+  cuvs::neighbors::dynamic_batching::search_params const& params,
+  dynamic_batching::index<uint8_t, int64_t> const& index,
+  raft::device_matrix_view<const uint8_t, int64_t, raft::row_major> queries,
+  raft::device_matrix_view<int64_t, int64_t, raft::row_major> neighbors,
+  raft::device_matrix_view<float, int64_t, raft::row_major> distances);
 
 /** @} */
 

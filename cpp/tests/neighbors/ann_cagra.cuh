@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -206,17 +206,22 @@ void InitDataset(const raft::resources& handle,
       raft::linalg::row_normalize<raft::linalg::L2Norm>(
         handle, raft::make_const_mdspan(dataset_view), dataset_view);
     }
-  } else if constexpr (std::is_same_v<DataT, std::int8_t>) {
-    raft::random::uniformInt(handle, r, datatset_ptr, size * dim, DataT(-10), DataT(10));
+  } else if constexpr (std::is_same_v<DataT, std::uint8_t> || std::is_same_v<DataT, std::int8_t>) {
+    if constexpr (std::is_same_v<DataT, std::int8_t>) {
+      raft::random::uniformInt(handle, r, datatset_ptr, size * dim, DataT(-10), DataT(10));
+    } else {
+      raft::random::uniformInt(handle, r, datatset_ptr, size * dim, DataT(1), DataT(20));
+    }
 
     if (metric == InnerProduct) {
       // TODO (enp1s0): Change this once row_normalize supports (u)int8 matrices.
       // https://github.com/rapidsai/raft/issues/2291
 
-      using ComputeT             = float;
-      auto dataset_view          = raft::make_device_matrix_view(datatset_ptr, size, dim);
-      auto dev_row_norm          = raft::make_device_vector<ComputeT>(handle, size);
-      const auto normalized_norm = 20 * std::sqrt(static_cast<ComputeT>(dim));
+      using ComputeT    = float;
+      auto dataset_view = raft::make_device_matrix_view(datatset_ptr, size, dim);
+      auto dev_row_norm = raft::make_device_vector<ComputeT>(handle, size);
+      const auto normalized_norm =
+        (std::is_same_v<DataT, std::uint8_t> ? 40 : 20) * std::sqrt(static_cast<ComputeT>(dim));
 
       raft::linalg::reduce<true, true>(dev_row_norm.data_handle(),
                                        datatset_ptr,
@@ -331,7 +336,7 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
   {
     // IVF_PQ and NN_DESCENT graph builds do not support BitwiseHamming
     if (ps.metric == cuvs::distance::DistanceType::BitwiseHamming &&
-        ((!std::is_same_v<DataT, int8_t>) ||
+        ((!std::is_same_v<DataT, uint8_t>) ||
          (ps.build_algo != graph_build_algo::ITERATIVE_CAGRA_SEARCH)))
       GTEST_SKIP();
     // If the dataset dimension is small and the dataset size is large, there can be a lot of
@@ -523,7 +528,7 @@ class AnnCagraAddNodesTest : public ::testing::TestWithParam<AnnCagraInputs> {
     if (ps.compression != std::nullopt) GTEST_SKIP();
     // IVF_PQ and NN_DESCENT graph builds do not support BitwiseHamming
     if (ps.metric == cuvs::distance::DistanceType::BitwiseHamming &&
-        ((!std::is_same_v<DataT, int8_t>) ||
+        ((!std::is_same_v<DataT, uint8_t>) ||
          (ps.build_algo != graph_build_algo::ITERATIVE_CAGRA_SEARCH)))
       GTEST_SKIP();
     // If the dataset dimension is small and the dataset size is large, there can be a lot of
@@ -733,7 +738,7 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
       GTEST_SKIP();
     // IVF_PQ and NN_DESCENT graph builds do not support BitwiseHamming
     if (ps.metric == cuvs::distance::DistanceType::BitwiseHamming &&
-        ((!std::is_same_v<DataT, int8_t>) ||
+        ((!std::is_same_v<DataT, uint8_t>) ||
          (ps.build_algo != graph_build_algo::ITERATIVE_CAGRA_SEARCH)))
       GTEST_SKIP();
     // If the dataset dimension is small and the dataset size is large, there can be a lot of
@@ -944,7 +949,7 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
     if (ps.compression != std::nullopt) GTEST_SKIP();
     // IVF_PQ and NN_DESCENT graph builds do not support BitwiseHamming
     if (ps.metric == cuvs::distance::DistanceType::BitwiseHamming &&
-        ((!std::is_same_v<DataT, int8_t>) ||
+        ((!std::is_same_v<DataT, uint8_t>) ||
          (ps.build_algo != graph_build_algo::ITERATIVE_CAGRA_SEARCH)))
       GTEST_SKIP();
     // If the dataset dimension is small and the dataset size is large, there can be a lot of
