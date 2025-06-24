@@ -312,9 +312,9 @@ RAFT_DEVICE_INLINE_FUNCTION void lds(uint4& x, const uint4* addr)
 
 RAFT_DEVICE_INLINE_FUNCTION void lds(int8_t& x, uint32_t addr)
 {
-  uint32_t res;
+  int32_t res;
   asm volatile("ld.shared.s8 {%0}, [%1];" : "=r"(res) : "r"(addr));
-  x = static_cast<uint32_t>(res);
+  x = static_cast<int8_t>(res);
 }
 
 RAFT_DEVICE_INLINE_FUNCTION void lds(int4& x, uint32_t addr)
