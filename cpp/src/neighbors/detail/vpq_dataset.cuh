@@ -339,6 +339,63 @@ __device__ auto compute_code(
   return code;
 }
 
+// Texture-based version for cache performance
+template <uint32_t SubWarpSize,
+          typename DataT,
+          typename MathT,
+          typename IdxT,
+          typename LabelT>
+__device__ auto compute_code_texture(
+  raft::device_matrix_view<const DataT, IdxT, raft::row_major> dataset,
+  std::optional<raft::device_matrix_view<const MathT, uint32_t, raft::row_major>> vq_centers,
+  cudaTextureObject_t pq_centers_tex,
+  uint32_t pq_book_size,
+  uint32_t pq_len,
+  uint32_t subspace_row_offset,
+  IdxT i,
+  uint32_t j,
+  LabelT vq_label) -> uint8_t
+{
+  auto data_mapping      = cuvs::spatial::knn::detail::utils::mapping<MathT>{};
+  const uint32_t lane_id = raft::Pow2<SubWarpSize>::mod(raft::laneId());
+
+  float min_dist = std::numeric_limits<float>::infinity();
+  uint8_t code   = 0;
+  
+  // Calculate distance for each PQ cluster
+  for (uint32_t l = lane_id; l < pq_book_size; l += SubWarpSize) {
+    float d = 0.0f;
+    #pragma unroll 8
+    for (uint32_t k = 0; k < pq_len; k++) {
+      auto jk = j * pq_len + k;
+      auto x  = data_mapping(dataset(i, jk));
+      if (vq_centers) { x -= vq_centers.value()(vq_label, jk); }
+      
+      // Use texture fetch for pq_centers - better caching for 2D access pattern
+      // tex2D expects (x, y) where x=column, y=row
+      MathT pq_val = tex2D<MathT>(pq_centers_tex, k, subspace_row_offset + l);
+      auto t = x - pq_val;
+      d += t * t;
+    }
+    if (d < min_dist) {
+      min_dist = d;
+      code     = uint8_t(l);
+    }
+  }
+  
+  // Reduce among threads
+  #pragma unroll
+  for (uint32_t stride = SubWarpSize >> 1; stride > 0; stride >>= 1) {
+    const auto other_dist = raft::shfl_xor(min_dist, stride, SubWarpSize);
+    const auto other_code = raft::shfl_xor(code, stride, SubWarpSize);
+    if (other_dist < min_dist) {
+      min_dist = other_dist;
+      code     = other_code;
+    }
+  }
+  return code;
+}
+
 template <int VecBytes = 16, typename T>
 __device__ inline void copy_vectorized(T* out, const T* in, uint32_t n)
 {
@@ -546,19 +603,19 @@ __launch_bounds__(BlockSize) RAFT_KERNEL process_and_fill_codes_subspaces_kernel
   raft::device_matrix_view<const DataT, IdxT, raft::row_major> dataset,
   std::optional<raft::device_matrix_view<const MathT, uint32_t, raft::row_major>> vq_centers,
   std::optional<raft::device_vector_view<const LabelT, IdxT, raft::row_major>> vq_labels,
-  raft::device_matrix_view<const MathT, uint32_t, raft::row_major> pq_centers)
+  cudaTextureObject_t pq_centers_tex,
+  uint32_t pq_len,
+  uint32_t pq_book_size_per_subspace)
 {
   constexpr uint32_t kSubWarpSize = std::min<uint32_t>(raft::WarpSize, 1u << PqBits);
   using subwarp_align             = raft::Pow2<kSubWarpSize>;
   const IdxT row_ix = subwarp_align::div(IdxT{threadIdx.x} + IdxT{BlockSize} * IdxT{blockIdx.x});
   if (row_ix >= out_codes.extent(0)) { return; }
 
-  const uint32_t pq_dim = raft::div_rounding_up_unsafe(dataset.extent(1), pq_centers.extent(1));
+  const uint32_t pq_dim = raft::div_rounding_up_unsafe(dataset.extent(1), pq_len);
 
   const uint32_t lane_id = raft::Pow2<kSubWarpSize>::mod(threadIdx.x);
   const LabelT vq_label  = vq_labels ? vq_labels.value()(row_ix) : 0;
-
-  // write label
   auto* out_codes_ptr = &out_codes(row_ix, 0);
 
   // write label
@@ -570,16 +627,13 @@ __launch_bounds__(BlockSize) RAFT_KERNEL process_and_fill_codes_subspaces_kernel
 
   cuvs::neighbors::ivf_pq::detail::bitfield_view_t<PqBits> code_view{out_codes_ptr};
   for (uint32_t j = 0; j < pq_dim; j++) {
-    // find PQ label
-    uint32_t subspace_offset = j * pq_centers.extent(1) * (1 << PqBits);
-    auto pq_subspace_view    = raft::make_device_matrix_view(
-      pq_centers.data_handle() + subspace_offset, (uint32_t)(1 << PqBits), pq_centers.extent(1));
-    std::optional<raft::device_matrix_view<const MathT, uint32_t, raft::row_major>>
-      pq_centers_smem = std::nullopt;
-    uint8_t code      = compute_code<kSubWarpSize>(
-      dataset, vq_centers, pq_centers_smem, pq_subspace_view, row_ix, j, vq_label);
-    // TODO: this writes in global memory one byte per warp, which is very slow.
-    //  It's better to keep the codes in the shared memory or registers and dump them at once.
+    // Subspace row offset in the flattened pq_centers array
+    uint32_t subspace_row_offset = j * pq_book_size_per_subspace;
+    
+    uint8_t code = compute_code_texture<kSubWarpSize, DataT, MathT, IdxT, LabelT>(
+      dataset, vq_centers, pq_centers_tex, pq_book_size_per_subspace, pq_len,
+      subspace_row_offset, row_ix, j, vq_label);
+    
     if (lane_id == 0) { code_view[j] = code; }
   }
 }
@@ -617,6 +671,35 @@ void process_and_fill_codes_subspaces(
 
   auto stream = raft::resource::get_cuda_stream(res);
 
+  // Create texture object for pq_centers
+  cudaTextureObject_t pq_centers_tex = 0;
+  cudaResourceDesc resDesc;
+  memset(&resDesc, 0, sizeof(resDesc));
+  resDesc.resType = cudaResourceTypePitch2D;
+  resDesc.res.pitch2D.devPtr = const_cast<MathT*>(pq_centers.data_handle());
+  resDesc.res.pitch2D.width = pq_centers.extent(1);
+  resDesc.res.pitch2D.height = pq_centers.extent(0);
+  resDesc.res.pitch2D.pitchInBytes = pq_centers.extent(1) * sizeof(MathT);
+  
+  if constexpr (std::is_same_v<MathT, float>) {
+    resDesc.res.pitch2D.desc = cudaCreateChannelDesc<float>();
+  } else if constexpr (std::is_same_v<MathT, __half>) {
+    resDesc.res.pitch2D.desc = cudaCreateChannelDesc<__half>();
+  } else {
+    static_assert(std::is_same_v<MathT, float> || std::is_same_v<MathT, __half>,
+                  "Only float and half types supported for texture");
+  }
+  
+  cudaTextureDesc texDesc;
+  memset(&texDesc, 0, sizeof(texDesc));
+  texDesc.addressMode[0] = cudaAddressModeClamp;
+  texDesc.addressMode[1] = cudaAddressModeClamp;
+  texDesc.filterMode = cudaFilterModePoint;
+  texDesc.readMode = cudaReadModeElementType;
+  texDesc.normalizedCoords = 0;
+  
+  RAFT_CUDA_TRY(cudaCreateTextureObject(&pq_centers_tex, &resDesc, &texDesc, nullptr));
+
   // TODO: with scaling workspace we could choose the batch size dynamically
   constexpr ix_t kReasonableMaxBatchSize = 65536;
   constexpr ix_t kBlockSize              = 256;
@@ -638,6 +721,10 @@ void process_and_fill_codes_subspaces(
       default: RAFT_FAIL("Invalid pq_bits (%u), the value must be within [4, 8]", pq_bits);
     }
   }(pq_bits);
+  
+  const uint32_t pq_book_size_per_subspace = pq_n_centers;
+  const uint32_t pq_len_val = pq_centers.extent(1);
+  
   for (const auto& batch : cuvs::spatial::knn::detail::utils::batch_load_iterator(
          dataset.data_handle(),
          n_rows,
@@ -660,9 +747,14 @@ void process_and_fill_codes_subspaces(
       batch_view,
       vq_centers,
       labels_view,
-      pq_centers);
+      pq_centers_tex,
+      pq_len_val,
+      pq_book_size_per_subspace);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
+  
+  // Cleanup texture object
+  RAFT_CUDA_TRY(cudaDestroyTextureObject(pq_centers_tex));
 }
 
 template <typename DatasetT, typename MathT, typename IdxT>
