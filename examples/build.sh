@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
 # cuvs empty project template build script
@@ -61,7 +61,11 @@ function gpuArch {
 PARALLEL_LEVEL=${PARALLEL_LEVEL:=$(nproc)}
 BUILD_TYPE=Release
 CUVS_REPO_REL=""
-EXTRA_CMAKE_ARGS=()
+CACHE_TOOL=ccache
+CACHE_ARGS=("-DCMAKE_CUDA_COMPILER_LAUNCHER=${CACHE_TOOL}"
+            "-DCMAKE_C_COMPILER_LAUNCHER=${CACHE_TOOL}"
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=${CACHE_TOOL}")
+EXTRA_CMAKE_ARGS=("${CACHE_ARGS[@]}")
 
 
 CUVS_CMAKE_CUDA_ARCHITECTURES=$(gpuArch)
