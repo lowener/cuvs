@@ -95,11 +95,39 @@ class scann_test : public ::testing::TestWithParam<scann_inputs> {
     auto h_database = raft::make_host_matrix<DataT, int64_t>(ps.num_db_vecs, ps.dim);
 
     raft::copy(h_database.data_handle(), database.data(), ps.num_db_vecs * ps.dim, stream_);
+    raft::resource::sync_stream(handle_);
+    database.resize(0, stream_);  // Free memory for now
 
     auto db_view = raft::make_host_matrix_view<const DataT, int64_t>(
       h_database.data_handle(), ps.num_db_vecs, ps.dim);
 
     return cuvs::neighbors::experimental::scann::build(handle_, ipams, db_view);
+  }
+
+  auto speed_test()
+  {
+    auto ipams = ps.index_params;
+
+    // additional stream for overlapping HtoD copy
+    size_t n_streams = 2;
+    raft::resource::set_cuda_stream_pool(handle_,
+                                         std::make_shared<rmm::cuda_stream_pool>(n_streams));
+
+    auto h_database = raft::make_host_matrix<DataT, int64_t>(ps.num_db_vecs, ps.dim);
+
+    raft::copy(h_database.data_handle(), database.data(), ps.num_db_vecs * ps.dim, stream_);
+
+    auto db_view = raft::make_host_matrix_view<const DataT, int64_t>(
+      h_database.data_handle(), ps.num_db_vecs, ps.dim);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto index      = cuvs::neighbors::experimental::scann::build(handle_, ipams, db_view);
+    auto end_time   = std::chrono::high_resolution_clock::now();
+    auto duration   = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    std::cout << "Dataset size: " << ps.num_db_vecs << "x" << ps.dim
+              << ", pqbits: " << ps.index_params.pq_bits << ", duration: " << duration.count()
+              << " milliseconds" << std::endl;
+    return index;
   }
 
   template <typename BuildIndex>
@@ -255,6 +283,27 @@ inline auto big_dims_all_pq_bits() -> test_cases_t
   return four_bit_ts + eight_bit_ts;
 }
 
+inline auto speed_big_dims() -> test_cases_t
+{
+  auto four_bit_ts = with_dims({64, 256, 512, 1024});
+
+  for (auto& ts : four_bit_ts) {
+    ts.num_db_vecs          = 5000000;
+    ts.index_params.pq_dim  = 8;
+    ts.index_params.pq_bits = 4;
+  }
+
+  auto eight_bit_ts = with_dims({64, 256, 512, 1024});
+
+  for (auto& ts : eight_bit_ts) {
+    ts.num_db_vecs          = 5000000;
+    ts.index_params.pq_dim  = 8;
+    ts.index_params.pq_bits = 8;
+  }
+
+  return four_bit_ts + eight_bit_ts;
+}
+
 inline auto bf16() -> test_cases_t
 {
   scann_inputs ts;
@@ -289,6 +338,12 @@ inline auto soar() -> test_cases_t
 }
 
 /* Test instantiations */
+
+#define TEST_BUILD_SPEED(type)                          \
+  TEST_P(type, build_speed) /* NOLINT */                \
+  {                                                     \
+    this->run([this]() { return this->speed_test(); }); \
+  }
 
 #define TEST_BUILD(type)                                \
   TEST_P(type, build) /* NOLINT */                      \

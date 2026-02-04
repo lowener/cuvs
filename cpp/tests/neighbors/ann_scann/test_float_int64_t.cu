@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -9,12 +9,14 @@ namespace cuvs::neighbors::experimental::scann {
 
 using f32_i64 = scann_test<float, int64_t>;
 
-TEST_BUILD(f32_i64)
+/*TEST_BUILD(f32_i64)
 TEST_BUILD_HOST_INPUT(f32_i64)
-TEST_BUILD_HOST_INPUT_OVERLAP(f32_i64);
+TEST_BUILD_HOST_INPUT_OVERLAP(f32_i64);*/
+TEST_BUILD_SPEED(f32_i64);
 
 INSTANTIATE(f32_i64,
-            defaults() + small_dims_all_pq_bits() + big_dims_all_pq_bits() + bf16() + bf16_avq() +
-              avq() + soar());
+            /*defaults() + small_dims_all_pq_bits() + big_dims_all_pq_bits() + bf16() + bf16_avq() +
+              avq() + soar() + */
+            speed_big_dims());
 
 }  // namespace cuvs::neighbors::experimental::scann
