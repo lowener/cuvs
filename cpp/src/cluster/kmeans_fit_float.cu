@@ -56,10 +56,11 @@ void fit(raft::resources const& handle,
          std::optional<raft::host_vector_view<const float, int64_t>> sample_weight,
          raft::device_matrix_view<float, int64_t> centroids,
          raft::host_scalar_view<float> inertia,
-         raft::host_scalar_view<int64_t> n_iter)
+         raft::host_scalar_view<int64_t> n_iter,
+         std::optional<raft::host_vector_view<int64_t, int64_t>> labels)
 {
   cuvs::cluster::kmeans::detail::fit<float, int64_t>(
-    handle, params, X, sample_weight, centroids, inertia, n_iter);
+    handle, params, X, sample_weight, centroids, inertia, n_iter, labels);
 }
 
 }  // namespace cuvs::cluster::kmeans
