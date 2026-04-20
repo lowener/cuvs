@@ -1015,8 +1015,6 @@ auto build_fine_clusters(const raft::resources& handle,
  * @param[out] inertia         (optional) If non-null, the sum of squared distances of samples to
  *                             their closest cluster center is written here.
  *                             Only supported when T == MathT (float/double).
- * @param[out] labels          (optional) If non-null, the labels of the clusters are returned here.
- *                             [dim = n_rows]
  */
 template <typename T, typename MathT, typename IdxT, typename MappingOpT>
 void build_hierarchical(const raft::resources& handle,
@@ -1027,8 +1025,7 @@ void build_hierarchical(const raft::resources& handle,
                         MathT* cluster_centers,
                         IdxT n_clusters,
                         MappingOpT mapping_op,
-                        MathT* inertia       = nullptr,
-                        uint32_t* labels_ret = nullptr)
+                        MathT* inertia = nullptr)
 {
   auto stream  = raft::resource::get_cuda_stream(handle);
   using LabelT = uint32_t;
@@ -1144,14 +1141,7 @@ void build_hierarchical(const raft::resources& handle,
   RAFT_EXPECTS(n_clusters_done == n_clusters, "Didn't process all clusters.");
 
   rmm::device_uvector<CounterT> cluster_sizes(n_clusters, stream, device_memory);
-  std::optional<rmm::device_uvector<LabelT>> labels_buf = std::nullopt;
-  LabelT* labels_ptr                                    = nullptr;
-  if (labels_ret == nullptr) {
-    labels_buf = rmm::device_uvector<LabelT>(n_rows, stream, device_memory);
-    labels_ptr = labels_buf.value().data();
-  } else {
-    labels_ptr = labels_ret;
-  }
+  rmm::device_uvector<LabelT> labels(n_rows, stream, device_memory);
 
   // Fine-tuning k-means for all clusters
   //
@@ -1169,7 +1159,7 @@ void build_hierarchical(const raft::resources& handle,
                      n_rows,
                      n_clusters,
                      cluster_centers,
-                     labels_ptr,
+                     labels.data(),
                      cluster_sizes.data(),
                      5,
                      MathT{0.2},
