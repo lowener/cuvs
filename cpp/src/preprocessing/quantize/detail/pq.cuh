@@ -11,9 +11,21 @@
 
 #include <cuvs/cluster/kmeans.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
+#include <raft/core/device_resources.hpp>
 #include <raft/core/operators.hpp>
+#include <raft/core/resource/cuda_stream_pool.hpp>
+#include <raft/core/resource/device_properties.hpp>
 #include <raft/matrix/init.cuh>
 #include <raft/util/cudart_utils.hpp>
+
+#include <chrono>
+#include <cstdlib>
+#include <future>
+#include <iostream>
+
+#include <rmm/cuda_stream_pool.hpp>
+
+#include <vector>
 
 #include "../../../cluster/kmeans_balanced.cuh"
 
@@ -112,22 +124,81 @@ auto train_pq_subspaces(
   }
 
   // Train PQ centers for each subspace
-  auto sub_dataset = raft::make_device_matrix<MathT, ix_t>(res, n_rows_train, pq_len);
+  raft::resource::sync_stream(res);
+  const auto subspace_train_start = std::chrono::steady_clock::now();
+  const bool has_stream_pool =
+    res.has_resource_factory(raft::resource::resource_type::CUDA_STREAM_POOL) &&
+    raft::resource::get_stream_pool_size(res) >= 1;
+  int32_t n_parallel_streams = 1;
+  if (has_stream_pool) {
+    n_parallel_streams =
+      std::max(n_parallel_streams, static_cast<int32_t>(raft::resource::get_stream_pool_size(res)));
+    n_parallel_streams = std::min(n_parallel_streams, pq_dim);
+  }
+  auto device_memory = raft::resource::get_workspace_resource_ref(res);
+  std::vector<raft::device_matrix<MathT, ix_t>> sub_datasets;
+  std::vector<raft::device_vector<uint32_t, ix_t>> sub_labels_bufs;
+  std::vector<raft::device_vector<uint32_t, ix_t>> pq_cluster_sizes_bufs;
+  sub_datasets.reserve(static_cast<std::size_t>(n_parallel_streams));
+  for (ix_t s = 0; s < n_parallel_streams; ++s) {
+    sub_datasets.push_back(raft::make_device_matrix<MathT, ix_t>(res, n_rows_train, pq_len));
+    if (is_balanced_kmeans(params)) {
+      sub_labels_bufs.push_back(raft::make_device_mdarray<uint32_t>(
+        res, device_memory, raft::make_extents<ix_t>(n_rows_train)));
+      pq_cluster_sizes_bufs.push_back(raft::make_device_mdarray<uint32_t>(
+        res, device_memory, raft::make_extents<ix_t>(pq_n_centers)));
+    }
+  }
 
   auto pq_centers =
     raft::make_device_matrix<MathT, uint32_t, raft::row_major>(res, pq_dim * pq_n_centers, pq_len);
-  auto trainset_ptr     = !vq_centers.empty() ? pq_trainset.data_handle() : dataset.data_handle();
-  auto sub_labels       = raft::make_device_vector<uint32_t, ix_t>(res, 0);
-  auto pq_cluster_sizes = raft::make_device_vector<uint32_t, ix_t>(res, 0);
-  auto device_memory    = raft::resource::get_workspace_resource_ref(res);
+  auto trainset_ptr = !vq_centers.empty() ? pq_trainset.data_handle() : dataset.data_handle();
+  auto empty_labels = raft::make_device_vector<uint32_t, ix_t>(res, 0);
+  auto empty_cluster_sizes = raft::make_device_vector<uint32_t, ix_t>(res, 0);
   if (is_balanced_kmeans(params)) {
-    sub_labels = raft::make_device_mdarray<uint32_t>(
-      res, device_memory, raft::make_extents<ix_t>(n_rows_train));
-    pq_cluster_sizes = raft::make_device_mdarray<uint32_t>(
-      res, device_memory, raft::make_extents<ix_t>(pq_n_centers));
+    empty_labels        = raft::make_device_vector<uint32_t, ix_t>(res, n_rows_train);
+    empty_cluster_sizes = raft::make_device_vector<uint32_t, ix_t>(res, pq_n_centers);
   }
 
-  for (ix_t m = 0; m < pq_dim; m++) {
+  auto train_subspace = [&](ix_t stream_idx, rmm::cuda_stream_view stream) {
+    raft::device_resources subspace_res(stream);
+    raft::resource::set_workspace_to_pool_resource(subspace_res, 3 * 1024 * 1024 * 1024ull);
+    for (ix_t m = stream_idx; m < pq_dim; m += n_parallel_streams) {
+      raft::copy_matrix(sub_datasets[stream_idx].data_handle(),
+                        pq_len,
+                        trainset_ptr + m * pq_len,
+                        dim,
+                        pq_len,
+                        n_rows_train,
+                        stream);
+      auto pq_centers_subspace_view =
+        raft::make_device_matrix_view<MathT, uint32_t, raft::row_major>(
+          pq_centers.data_handle() + m * pq_n_centers * pq_len, pq_n_centers, pq_len);
+      auto labels_view =
+        is_balanced_kmeans(params) ? sub_labels_bufs[stream_idx].view() : empty_labels.view();
+      auto cluster_sizes_view = is_balanced_kmeans(params)
+                                  ? pq_cluster_sizes_bufs[stream_idx].view()
+                                  : empty_cluster_sizes.view();
+      cuvs::neighbors::detail::train_pq_centers<MathT, ix_t>(
+        subspace_res,
+        params.kmeans_params,
+        raft::make_const_mdspan(sub_datasets[stream_idx].view()),
+        pq_centers_subspace_view,
+        labels_view,
+        cluster_sizes_view);
+    }
+  };
+
+  std::vector<std::future<void>> futures;
+  futures.reserve(static_cast<std::size_t>(n_parallel_streams));
+  for (ix_t s = 0; s < n_parallel_streams; ++s) {
+    futures.push_back(std::async(
+      std::launch::async, train_subspace, s, raft::resource::get_next_usable_stream(res, s)));
+  }
+  for (auto& future : futures) {
+    future.wait();
+  }
+  /*for (ix_t m = 0; m < pq_dim; m++) {
     raft::copy_matrix(sub_dataset.data_handle(),
                       pq_len,
                       trainset_ptr + m * pq_len,
@@ -144,7 +215,7 @@ auto train_pq_subspaces(
       pq_centers_subspace_view,
       sub_labels.view(),
       pq_cluster_sizes.view());
-  }
+  }*/
   return pq_centers;
 }
 

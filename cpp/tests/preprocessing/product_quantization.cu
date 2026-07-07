@@ -5,14 +5,18 @@
 
 #include "../test_utils.cuh"
 #include <chrono>
+#include <cstdlib>
 #include <cuvs/preprocessing/quantize/pq.hpp>
 #include <cuvs/stats/trustworthiness_score.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/cuda_stream_pool.hpp>
+#include <raft/core/resource/device_properties.hpp>
 #include <raft/matrix/gather.cuh>
 #include <raft/matrix/init.cuh>
 #include <raft/random/make_blobs.cuh>
 #include <raft/util/cudart_utils.hpp>
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/mr/managed_memory_resource.hpp>
 
 namespace cuvs::preprocessing::quantize::pq {
@@ -106,6 +110,25 @@ class ProductQuantizationTest : public ::testing::TestWithParam<ProductQuantizat
  protected:
   void SetUp() override
   {
+    raft::resource::set_workspace_to_pool_resource(handle, 10 * 1024 * 1024 * 1024ull);
+    // PQ subspace training uses one stream per concurrent kmeans; size the pool to saturate SMs.
+    // Set CUVS_PQ_SUBSPACE_PARALLEL_STREAMS=0 to skip stream pool, 1 for single-stream baseline.
+    std::size_t n_streams = 1;
+    if (const char* env = std::getenv("CUVS_PQ_SUBSPACE_PARALLEL_STREAMS");
+        env != nullptr && env[0] != '\0') {
+      n_streams = static_cast<std::size_t>(std::max(std::strtol(env, nullptr, 10), 0L));
+    } else {
+      const std::size_t sm_count =
+        static_cast<std::size_t>(raft::resource::get_device_properties(handle).multiProcessorCount);
+      constexpr std::size_t k_streams_per_sm = 2;
+      n_streams                              = params_.pq_dim > 0
+                                                 ? std::min<std::size_t>(params_.pq_dim, sm_count * k_streams_per_sm)
+                                                 : sm_count * k_streams_per_sm;
+    }
+    if (n_streams > 0) {
+      raft::resource::set_cuda_stream_pool(handle,
+                                           std::make_shared<rmm::cuda_stream_pool>(n_streams));
+    }
     if constexpr (std::is_same_v<T, half>) {
       raft::random::RngState r(params_.seed);
       raft::random::uniform(
