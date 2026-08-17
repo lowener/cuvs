@@ -3,15 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define PQ_EXAMPLE_IVF_PQ 1
-#define PQ_EXAMPLE_FAISS  1
+//#define PQ_EXAMPLE_IVF_PQ 1
+//#define PQ_EXAMPLE_FAISS  1
 
 #include <cuvs/cluster/kmeans.hpp>
-#include <cuvs/core/bitmap.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
+#ifdef PQ_EXAMPLE_IVF_PQ
 #include <cuvs/neighbors/ivf_pq.hpp>
+#endif
 #include <cuvs/preprocessing/quantize/pq.hpp>
 #include <raft/core/device_mdarray.hpp>
+#include <raft/core/host_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/core/resource/cuda_stream_pool.hpp>
 #include <raft/random/make_blobs.cuh>
@@ -23,12 +25,12 @@
 #endif
 #include <fstream>
 #include <iostream>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 #include <string>
 #include <vector>
 
 #include "ann_utils.cuh"
-#include <omp.h>
+//#include "common.cuh"
 
 struct ProgramArgs {
   std::string method = "pq";  // pq, ivfpq, faiss, interop_pq_faiss, interop_faiss_pq, all
@@ -156,8 +158,14 @@ void load_dataset(const raft::device_resources& res, float* data_ptr, int n_vect
     res,
     raft::make_device_matrix_view<float, int64_t>(data_ptr, n_vectors, dim),
     labels.view(),
-    10);
+    1024);
 }
+
+/*raft::device_matrix<float, int64_t> load_dataset(const raft::device_resources& res,
+                                                 std::string const& dataset_path)
+{
+  return read_fbin_dataset(res, dataset_path);
+}*/
 
 void write_csv(const std::string& filename, const std::vector<TimingResults>& all_results)
 {
@@ -406,10 +414,14 @@ void pq_api(raft::device_resources const& res,
   auto n_vectors       = dataset.extent(0);
   auto n_queries       = queries.extent(0);
   auto k_neighbors     = neighbors_gt.extent(1);
-  auto kmeans_type     = kmeans_balanced ? cuvs::cluster::kmeans::kmeans_type::KMeansBalanced
-                                         : cuvs::cluster::kmeans::kmeans_type::KMeans;
+  /*using  kmeans_params_variant = cuvs::preprocessing::quantize::pq::kmeans_params_variant;
+  kmeans_params_variant kmeans_params =
+    kmeans_balanced ? kmeans_params_variant{cuvs::cluster::kmeans::balanced_params{cuvs::distance::DistanceType::L2Expanded, 100}}
+                    : kmeans_params_variant{cuvs::cluster::kmeans::params{cuvs::distance::DistanceType::L2Expanded, 1 << pq_bits, cuvs::cluster::kmeans::params::InitMethod::KMeansPlusPlus, 250}};
   auto params =
-    quantize::pq::params{pq_bits, pq_dim, use_subspaces, use_vq, 0, 25, kmeans_type, 256, 1024};
+    quantize::pq::params{pq_bits, pq_dim, use_subspaces, use_vq, 0, kmeans_params, 256, 1024};*/
+  auto params =
+    quantize::pq::params{pq_bits, pq_dim, use_subspaces, use_vq, 0, 25, cuvs::cluster::kmeans::kmeans_type::KMeansBalanced, 256, 1024};
   auto reconstructed_dataset =
     raft::make_device_matrix<dataset_dtype, indexing_dtype>(res, n_vectors, dim);
   auto quantized_dim = quantize::pq::get_quantized_dim(params);
@@ -719,9 +731,12 @@ int main(int argc, char** argv)
   auto n_vectors   = args.n_vectors;
   auto n_queries   = 1000;
   auto k_neighbors = 50;
-
+  auto pool_gb = 6;
   raft::device_resources res;
-  raft::resource::set_workspace_to_pool_resource(res, 6 * 1024 * 1024 * 1024ull);
+  rmm::mr::pool_memory_resource pool_mr(
+    rmm::mr::get_current_device_resource_ref(),
+    static_cast<size_t>(pool_gb) * 1024ull * 1024ull * 1024ull);
+  rmm::mr::set_current_device_resource(pool_mr);
   size_t n_streams = 1;
   raft::resource::set_cuda_stream_pool(res, std::make_shared<rmm::cuda_stream_pool>(n_streams));
   auto stream  = raft::resource::get_cuda_stream(res);
@@ -730,6 +745,11 @@ int main(int argc, char** argv)
 
   load_dataset(res, dataset.data_handle(), n_vectors, dim);
   load_dataset(res, queries.data_handle(), n_queries, dim);
+  /*dataset = load_dataset(res, "/raid/mide/rapids/sift-128-euclidean/base.fbin");
+  n_vectors = dataset.extent(0);
+  dim = dataset.extent(1);
+  queries = load_dataset(res, "/raid/mide/rapids/sift-128-euclidean/queries.fbin");
+  n_queries = queries.extent(0);*/
   auto dataset_cpu      = raft::make_host_matrix<float, int64_t>(n_vectors, dim);
   auto queries_cpu      = raft::make_host_matrix<float, int64_t>(n_queries, dim);
   auto neighbors_gt_cpu = raft::make_host_matrix<indexing_dtype, int64_t>(n_queries, k_neighbors);
