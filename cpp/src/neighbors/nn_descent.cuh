@@ -184,21 +184,21 @@ void build(raft::resources const& res,
   detail::build<T, IdxT>(res, params, dataset, idx);
 }
 
-template <typename IdxT = uint32_t>
+template <typename DataT, typename IdxT = uint32_t>
 auto build(raft::resources const& res,
            index_params const& params,
-           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset) -> index<IdxT>
+           cuvs::neighbors::device_bbq_dataset_view<DataT, int64_t> dataset) -> index<IdxT>
 {
-  return detail::build<IdxT>(res, params, dataset);
+  return detail::build<DataT, IdxT>(res, params, dataset);
 }
 
-template <typename IdxT = uint32_t>
+template <typename DataT, typename IdxT = uint32_t>
 void build(raft::resources const& res,
            index_params const& params,
-           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
+           cuvs::neighbors::device_bbq_dataset_view<DataT, int64_t> dataset,
            index<IdxT>& idx)
 {
-  detail::build<IdxT>(res, params, dataset, idx);
+  detail::build<DataT, IdxT>(res, params, dataset, idx);
 }
 
 /** @} */  // end group nn-descent

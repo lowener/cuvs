@@ -50,40 +50,36 @@ enum class bbq_code_layout {
   unsigned_byte, /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
 
 };
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 struct bbq_quantizer {
-  template <typename T, typename IdT, typename Acc>
-  using dense_owning_matrix = cuvs::neighbors::detail::dense_owning_matrix<T, IdT, Acc>;
-  template <typename T, typename IdT, typename Acc>
-  using dense_owning_vector = cuvs::neighbors::detail::dense_owning_vector<T, IdT, Acc>;
-  dense_owning_matrix<uint8_t, IdxT, Accessor> codes;
-  dense_owning_vector<float, IdxT, Accessor> lower_intervals;
-  dense_owning_vector<float, IdxT, Accessor> upper_intervals;
-  dense_owning_vector<float, IdxT, Accessor> additional_corrections;
-  dense_owning_vector<int32_t, IdxT, Accessor> quantized_component_sums;
-  dense_owning_vector<DataT, IdxT, Accessor> centroid;
+  raft::device_mdarray<uint8_t, raft::matrix_extent<IdxT>> codes;
+  raft::device_mdarray<float, raft::vector_extent<IdxT>> lower_intervals;
+  raft::device_mdarray<float, raft::vector_extent<IdxT>> upper_intervals;
+  raft::device_mdarray<float, raft::vector_extent<IdxT>> additional_corrections;
+  raft::device_mdarray<int32_t, raft::vector_extent<IdxT>> quantized_component_sums;
+  raft::device_mdarray<DataT, raft::vector_extent<IdxT>> centroid;
 
   uint32_t bits{};
   bbq_code_layout layout{bbq_code_layout::single_bit};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
-  bbq_quantizer(dense_owning_matrix<uint8_t, IdxT, Accessor>&& codes,
-                dense_owning_vector<float, IdxT, Accessor>&& lower_intervals,
-                dense_owning_vector<float, IdxT, Accessor>&& upper_intervals,
-                dense_owning_vector<float, IdxT, Accessor>&& additional_corrections,
-                dense_owning_vector<int32_t, IdxT, Accessor>&& quantized_component_sums,
-                dense_owning_vector<DataT, IdxT, Accessor>&& centroid,
+  bbq_quantizer(raft::device_mdarray<uint8_t, raft::matrix_extent<IdxT>>&& codes_,
+                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& lower_intervals_,
+                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& upper_intervals_,
+                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& additional_corrections_,
+                raft::device_mdarray<int32_t, raft::vector_extent<IdxT>>&& quantized_component_sums_,
+                raft::device_mdarray<DataT, raft::vector_extent<IdxT>>&& centroid_,
                 uint32_t bits,
                 bbq_code_layout layout,
                 cuvs::distance::DistanceType metric,
                 float centroid_norm_sq) noexcept
-    : codes{std::move(codes)},
-      lower_intervals{std::move(lower_intervals)},
-      upper_intervals{std::move(upper_intervals)},
-      additional_corrections{std::move(additional_corrections)},
-      quantized_component_sums{std::move(quantized_component_sums)},
-      centroid{std::move(centroid)},
+    : codes{std::move(codes_)},
+      lower_intervals{std::move(lower_intervals_)},
+      upper_intervals{std::move(upper_intervals_)},
+      additional_corrections{std::move(additional_corrections_)},
+      quantized_component_sums{std::move(quantized_component_sums_)},
+      centroid{std::move(centroid_)},
       bits{bits},
       layout{layout},
       metric{metric},
@@ -119,26 +115,44 @@ struct bbq_quantizer {
   }
 };
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 struct bbq_quantizer_view {
-  using owning_accessor =
-    cuvs::neighbors::detail::dataset_owning_accessor_for_view<DataT, Accessor>;
-  using owning_storage = bbq_quantizer<DataT, IdxT, owning_accessor>;
-  template <typename T, typename IdT, typename Acc>
-  using dense_view_matrix = cuvs::neighbors::detail::dense_view_matrix<T, IdT, Acc>;
-  template <typename T, typename IdT, typename Acc>
-  using dense_view_vector = cuvs::neighbors::detail::dense_view_vector<T, IdT, Acc>;
-  dense_view_matrix<const uint8_t, IdxT, Accessor> codes;
-  dense_view_vector<const float, IdxT, Accessor> lower_intervals;
-  dense_view_vector<const float, IdxT, Accessor> upper_intervals;
-  dense_view_vector<const float, IdxT, Accessor> additional_corrections;
-  dense_view_vector<const int32_t, IdxT, Accessor> quantized_component_sums;
-  dense_view_vector<const DataT, IdxT, Accessor> centroid;
+  using owning_storage = bbq_quantizer<DataT, IdxT>;
+  raft::device_mdspan<const uint8_t, raft::matrix_extent<IdxT>, raft::layout_c_contiguous> codes;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> lower_intervals;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> upper_intervals;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> additional_corrections;
+  raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous> quantized_component_sums;
+  raft::device_mdspan<const DataT, raft::vector_extent<IdxT>, raft::layout_c_contiguous> centroid;
 
   uint32_t bits{};
   bbq_code_layout layout{bbq_code_layout::single_bit};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
+
+  bbq_quantizer_view(
+    raft::device_mdspan<const uint8_t, raft::matrix_extent<IdxT>, raft::layout_c_contiguous> codes_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> lower_intervals_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> upper_intervals_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> additional_corrections_,
+    raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous> quantized_component_sums_,
+    raft::device_mdspan<const DataT, raft::vector_extent<IdxT>, raft::layout_c_contiguous> centroid_,
+    uint32_t bits_,
+    bbq_code_layout layout_,
+    cuvs::distance::DistanceType metric_,
+    float centroid_norm_sq_) noexcept
+    : codes{codes_.view()},
+      lower_intervals{lower_intervals_.view()},
+      upper_intervals{upper_intervals_.view()},
+      additional_corrections{additional_corrections_.view()},
+      quantized_component_sums{quantized_component_sums_.view()},
+      centroid{centroid_.view()},
+      bits{bits_},
+      layout{layout_},
+      metric{metric_},
+      centroid_norm_sq{centroid_norm_sq_}
+  {
+  }
 
   bbq_quantizer_view(const owning_storage& quantizer) noexcept
     : codes{quantizer.codes.view()},
@@ -161,22 +175,25 @@ struct bbq_quantizer_view {
   }
 };
 
+template <typename DataT, typename IdxT>
+using device_bbq_quantizer_view = bbq_quantizer_view<DataT, IdxT>;
+
 /** @} */  // end of bbq group
 
 }  // namespace preprocessing::quantize::bbq
 
 namespace neighbors {
 struct bbq_dataset_container {
-  template <typename DataT, typename IdxT, typename Accessor>
-  using owning_storage = cuvs::preprocessing::quantize::bbq::bbq_quantizer<DataT, IdxT, Accessor>;
-  template <typename DataT, typename IdxT, typename Accessor>
+  template <typename DataT, typename IdxT>
+  using owning_storage = cuvs::preprocessing::quantize::bbq::bbq_quantizer<DataT, IdxT>;
+  template <typename DataT, typename IdxT>
   using view_storage =
-    cuvs::preprocessing::quantize::bbq::bbq_quantizer_view<DataT, IdxT, Accessor>;
+    cuvs::preprocessing::quantize::bbq::bbq_quantizer_view<DataT, IdxT>;
 };
 
 template <typename DataT, typename IdxT, typename Accessor>
 struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
-  using owning_storage_type = bbq_dataset_container::owning_storage<DataT, IdxT, Accessor>;
+  using owning_storage_type = bbq_dataset_container::owning_storage<DataT, IdxT>;
   std::vector<owning_storage_type> quantizers;
 
   dataset(owning_storage_type&& quantizer) noexcept { add_quantizer(std::move(quantizer)); }
@@ -218,9 +235,8 @@ struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
 
 template <typename DataT, typename IdxT, typename Accessor>
 struct dataset_view<bbq_dataset_container, DataT, IdxT, Accessor> {
-  using owning_storage_type = bbq_dataset_container::
-    owning_storage<DataT, IdxT, detail::dataset_owning_accessor_for_view<DataT, Accessor>>;
-  using view_storage_type = bbq_dataset_container::view_storage<DataT, IdxT, Accessor>;
+  using owning_storage_type = bbq_dataset_container::owning_storage<DataT, IdxT>;
+  using view_storage_type = bbq_dataset_container::view_storage<DataT, IdxT>;
   std::vector<view_storage_type> quantizers;
 
   dataset_view(const std::vector<owning_storage_type>& quantizers) noexcept
@@ -268,25 +284,18 @@ struct dataset_view<bbq_dataset_container, DataT, IdxT, Accessor> {
   }
 };
 
-template <typename IdxT>
+template <typename DataT, typename IdxT>
 using device_bbq_dataset =
-  dataset<bbq_dataset_container, float, IdxT, detail::device_owning_accessor<float>>;
+  dataset<bbq_dataset_container, DataT, IdxT, detail::device_owning_accessor<DataT>>;
 
-template <typename IdxT>
+template <typename DataT, typename IdxT>
 using device_bbq_dataset_view =
-  dataset_view<bbq_dataset_container, float, IdxT, detail::device_view_accessor<float>>;
+  dataset_view<bbq_dataset_container, DataT, IdxT, detail::device_view_accessor<DataT>>;
 
-template <typename IdxT>
-using host_bbq_dataset =
-  dataset<bbq_dataset_container, float, IdxT, detail::host_owning_accessor<float>>;
 
-template <typename IdxT>
-using host_bbq_dataset_view =
-  dataset_view<bbq_dataset_container, float, IdxT, detail::host_view_accessor<float>>;
-
-template <typename IdxT>
-struct owning_dataset_for_view<device_bbq_dataset_view<IdxT>> {
-  using type = device_bbq_dataset<IdxT>;
+template <typename DataT, typename IdxT>
+struct owning_dataset_for_view<device_bbq_dataset_view<DataT, IdxT>> {
+  using type = device_bbq_dataset<DataT, IdxT>;
 };
 
 template <typename DatasetT>
@@ -299,7 +308,7 @@ template <typename DatasetT>
 inline constexpr bool is_bbq_dataset_v = is_bbq_dataset<DatasetT>::value;
 
 template <typename DataT, typename IdxT, typename Accessor>
-struct dataset_view_kind_of<dataset<bbq_dataset_container, DataT, IdxT, Accessor>> {
+struct dataset_view_kind_of<dataset_view<bbq_dataset_container, DataT, IdxT, Accessor>> {
   static constexpr dataset_view_kind value = dataset_view_kind::bbq;
 };
 template <typename V>

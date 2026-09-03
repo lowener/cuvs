@@ -13,20 +13,6 @@
 using namespace raft;
 namespace cuvs::neighbors::nn_descent {
 
-auto build(raft::resources const& res,
-           index_params const& params,
-           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
-           std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph)
-  -> index<uint32_t>
-{
-  if (!graph.has_value()) { return detail::build<uint32_t>(res, params, dataset); }
-
-  std::optional<raft::device_matrix_view<float, int64_t, raft::row_major>> distances = std::nullopt;
-  index<uint32_t> idx{res, graph.value(), distances, params.metric};
-  detail::build<uint32_t>(res, params, dataset, idx);
-  return idx;
-}
-
 /**
  * @brief Test if we have enough GPU memory to run NN descent algorithm.
  * *

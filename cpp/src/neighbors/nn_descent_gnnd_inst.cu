@@ -39,6 +39,12 @@ template void detail::GNND<const data_t, int>::build<raft::identity_op>(
   bool return_distances,
   float* output_distances,
   raft::identity_op dist_epilogue);
+template void detail::GNND<const data_t, int>::build<raft::identity_op>(
+  cuvs::neighbors::device_bbq_dataset_view<std::remove_const_t<data_t>, int64_t> dataset,
+  int* output_graph,
+  bool return_distances,
+  float* output_distances,
+  raft::identity_op dist_epilogue);
 template void detail::GNND<const data_t, int>::local_join<raft::identity_op>(
   cudaStream_t stream, raft::identity_op dist_epilogue);
 

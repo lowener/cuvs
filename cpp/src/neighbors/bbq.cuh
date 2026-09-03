@@ -35,9 +35,9 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
   return 0;
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset)
 {
   return get_encoded_row_length(dataset.layout, dataset.bits, dataset.dim());
 }
@@ -181,20 +181,20 @@ __device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
   }
 }
 /** Integer inner product between two encoded rows. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ int64_t
 code_inner_product(const uint8_t* row_a,
                    const uint8_t* row_b,
-                   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
+                   const device_bbq_quantizer_view<DataT, IdxT>& dataset)
 {
   return code_inner_product(
     row_a, row_b, dataset.layout, dataset.bits, dataset.dim(), get_encoded_row_length(dataset));
 }
 
 /** Centered dot product of two rows. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset,
   float code_ip,
   int64_t row_a,
   int64_t row_b)
@@ -212,9 +212,9 @@ __device__ __forceinline__ float centered_dot(
 }
 
 /** Centered dot product. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset, int64_t row_a, int64_t row_b)
 {
   const uint8_t* codes_a = dataset.codes.data_handle() + row_a * get_encoded_row_length(dataset);
   const uint8_t* codes_b = dataset.codes.data_handle() + row_b * get_encoded_row_length(dataset);
@@ -223,9 +223,9 @@ __device__ __forceinline__ float centered_dot(
 }
 
 // Dot product overload when the centered dot product is already computed
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b)
@@ -234,17 +234,17 @@ __device__ __forceinline__ float dot_product(
          dataset.additional_corrections(row_b) - dataset.centroid_norm_sq;
 }
 /** Dot product. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset, int64_t row_a, int64_t row_b)
 {
   return dot_product(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
 /** Squared L2 distance overload when the centered dot product is already computed */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b)
@@ -254,16 +254,16 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset, int64_t row_a, int64_t row_b)
 {
   return l2_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b,
@@ -274,9 +274,9 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 // norm_product = norm_a * norm_b
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset,
   int64_t row_a,
   int64_t row_b,
   float norm_product)
@@ -285,17 +285,17 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 /** Squared norm of one original-space row. */
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+template <typename DataT, typename IdxT>
+__device__ __forceinline__ float row_norm(const device_bbq_quantizer_view<DataT, IdxT>& dataset,
                                           int64_t row)
 {
   const float norm = dot_product(dataset, row, row);
   return norm < 0.0f ? 0.0f : norm;
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 struct bbq_row_norm_op {
-  const bbq_quantizer_view<DataT, IdxT, Accessor> quantizer;
+  const device_bbq_quantizer_view<DataT, IdxT> quantizer;
 
   __device__ auto operator()(size_t row) const -> float
   {
@@ -386,10 +386,10 @@ code_inner_product_asymmetric_tiled(const uint8_t* codes_document,
 }
 
 /** Centered dot product of two rows. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_document,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   float code_ip,
   int64_t row_document,
   int64_t row_query)
@@ -411,10 +411,10 @@ __device__ __forceinline__ float centered_dot(
 }
 
 /** Centered dot product. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_document,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   int64_t row_document,
   int64_t row_query)
 {
@@ -433,10 +433,10 @@ __device__ __forceinline__ float centered_dot(
 }
 
 // Dot product overload when the centered dot product is already computed
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_document,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   float centered_dot_value,
   int64_t row_document,
   int64_t row_query)
@@ -445,10 +445,10 @@ __device__ __forceinline__ float dot_product(
          dataset_query.additional_corrections(row_query) - dataset_document.centroid_norm_sq;
 }
 /** Dot product. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_doc,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   int64_t row_document,
   int64_t row_query)
 {
@@ -460,10 +460,10 @@ __device__ __forceinline__ float dot_product(
 }
 
 /** Squared L2 distance overload when the centered dot product is already computed */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_doc,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   float centered_dot_value,
   int64_t row_document,
   int64_t row_query)
@@ -474,10 +474,10 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_doc,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   int64_t row_document,
   int64_t row_query)
 {
@@ -488,10 +488,10 @@ __device__ __forceinline__ float l2_distance(
                      row_query);
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_doc,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   float centered_dot_value,
   int64_t row_document,
   int64_t row_query,
@@ -503,10 +503,10 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 // norm_product = norm_a * norm_b
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 __device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_doc,
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset_query,
   int64_t row_document,
   int64_t row_query,
   float norm_product)
