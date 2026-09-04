@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -158,6 +158,9 @@ class algo : public algo_base {
   // The client code should call set_search_dataset() before searching,
   // and should not release dataset before searching is finished.
   virtual void set_search_dataset(const T* /*dataset*/, size_t /*nrow*/) {};
+
+  // One-off work on the base set that should not be charged to the measured build time.
+  virtual void prepare_build(const T* /*dataset*/, size_t /*nrow*/) {};
 
   /**
    * Make a shallow copy of the algo wrapper that shares the resources and ensures thread-safe
