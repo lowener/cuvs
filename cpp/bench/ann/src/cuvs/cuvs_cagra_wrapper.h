@@ -195,6 +195,23 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 
   void build(const T* dataset, size_t nrow) final;
 
+  /** Prototype: quantize the base set (or read the cached codes) before the build is timed. */
+  void prepare_build(const T* dataset, size_t nrow) override
+  {
+    if constexpr (std::is_same_v<T, float>) {
+      if (index_params_.bbq.has_value()) {
+        bbq_dataset_ = std::make_shared<cuvs::neighbors::device_bbq_dataset<int64_t>>(
+          cuvs_internal::bbq::quantize_to_device(handle_,
+                                                 dataset,
+                                                 static_cast<int64_t>(nrow),
+                                                 static_cast<int64_t>(dim_),
+                                                 parse_metric_type(metric_),
+                                                 index_params_.bbq->query_bits,
+                                                 index_params_.bbq->doc_bits));
+      }
+    }
+  }
+
   void set_search_param(const search_param_base& param, const void* filter_bitset) override;
 
   void set_search_dataset(const T* dataset, size_t nrow) override;
@@ -243,10 +260,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   /** Train the VPQ codebooks and create the CAGRA-Q index sharing the graph of `index_`. */
   void compress_dataset(const T* dataset, size_t nrow);
 
-  /** Prototype: run the NN-Descent graph build on BBQ codes instead of the dense rows. */
-  void build_bbq_nn_descent(const T* dataset,
-                            size_t nrow,
-                            const cuvs::neighbors::cagra::index_params& params);
+  /** Prototype: run the NN-Descent graph build on the BBQ codes prepare_build() made. */
+  void build_bbq_nn_descent(size_t nrow, const cuvs::neighbors::cagra::index_params& params);
 
   // handle_ must go first to make sure it dies last and all memory allocated in pool
   configured_raft_resources handle_{};
@@ -281,6 +296,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
       std::make_shared<std::vector<raft::device_matrix<T, int64_t, raft::row_major>>>();
   std::shared_ptr<cuvs::neighbors::device_vpq_dataset<half, int64_t>> vpq_dataset_;
   std::shared_ptr<cuvs::neighbors::cagra::vpq_f16_index<T, IdxT>> vpq_index_;
+  // Set by prepare_build() when BBQ is on; dropped as soon as the kNN graph is out.
+  std::shared_ptr<cuvs::neighbors::device_bbq_dataset<int64_t>> bbq_dataset_;
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -293,42 +310,27 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 };
 
 template <typename T, typename IdxT>
-void cuvs_cagra<T, IdxT>::build_bbq_nn_descent(
-  const T* dataset, size_t nrow, const cuvs::neighbors::cagra::index_params& params)
+void cuvs_cagra<T, IdxT>::build_bbq_nn_descent(size_t nrow,
+                                               const cuvs::neighbors::cagra::index_params& params)
 {
   using nn_descent_params = cuvs::neighbors::cagra::graph_build_params::nn_descent_params;
-  if (!std::holds_alternative<nn_descent_params>(params.graph_build_params)) {
-    throw std::runtime_error("nn_descent_bbq_* requires graph_build_algo=NN_DESCENT");
-  }
-  // The public optimize() takes no such flag, so fail rather than ignore it.
-  if (params.guarantee_connectivity) {
-    throw std::runtime_error("nn_descent_bbq_* does not support guarantee_connectivity");
-  }
+  RAFT_EXPECTS(std::holds_alternative<nn_descent_params>(params.graph_build_params),
+               "BBQ requires graph_build_algo=NN_DESCENT.");
+  RAFT_EXPECTS(!params.guarantee_connectivity && index_params_.num_dataset_splits <= 1,
+               "BBQ NN-Descent supports neither guarantee_connectivity nor dataset splits.");
   const auto n_rows = static_cast<int64_t>(nrow);
-  const auto metric = parse_metric_type(metric_);
 
-  // Quantize (or load the cached codes) before the graph build, so that NN-Descent sees the codes
-  // as just another device buffer. They are dropped again as soon as the kNN graph is out.
-  auto bbq_dataset = cuvs_internal::bbq::quantize_to_device(handle_,
-                                                            dataset,
-                                                            n_rows,
-                                                            static_cast<int64_t>(dim_),
-                                                            metric,
-                                                            index_params_.bbq->query_bits,
-                                                            index_params_.bbq->doc_bits);
-
-  // Mirrors what CAGRA does to the NN-Descent parameters on the dense path.
+  // Aligned the same way CAGRA aligns them on the dense path.
   auto nnd_params = std::get<nn_descent_params>(params.graph_build_params);
-  if (nnd_params.graph_degree != params.intermediate_graph_degree) {
-    nnd_params = nn_descent_params(params.intermediate_graph_degree, metric);
-  }
-  nnd_params.metric           = metric;
+  nnd_params.metric           = params.metric;
+  nnd_params.graph_degree     = params.intermediate_graph_degree;
   nnd_params.return_distances = false;
 
   auto knn_graph = raft::make_host_matrix<IdxT, int64_t>(
     n_rows, static_cast<int64_t>(params.intermediate_graph_degree));
   cuvs::neighbors::nn_descent::build(
-    handle_, nnd_params, bbq_dataset.as_dataset_view(), knn_graph.view());
+    handle_, nnd_params, bbq_dataset_->as_dataset_view(), knn_graph.view());
+  bbq_dataset_.reset();
 
   auto cagra_graph =
     raft::make_host_matrix<IdxT, int64_t>(n_rows, static_cast<int64_t>(params.graph_degree));
@@ -344,11 +346,9 @@ void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
 {
   auto dataset_extents = raft::make_extents<int64_t>(nrow, dim_);
   auto params          = index_params_.cagra_params(dataset_extents, parse_metric_type(metric_));
-  if constexpr (std::is_same_v<T, float>) {
-    if (index_params_.bbq.has_value()) {
-      build_bbq_nn_descent(dataset, nrow, params);
-      return;
-    }
+  if (bbq_dataset_) {
+    build_bbq_nn_descent(nrow, params);
+    return;
   }
   // The host paths keep the graph only, so the index need not hold a view of the caller's rows.
   auto host_params                    = params;

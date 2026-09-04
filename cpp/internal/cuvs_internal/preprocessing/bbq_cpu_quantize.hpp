@@ -290,6 +290,17 @@ inline host_storage quantize(const float* data,
                       centroid_norm_sq};
 }
 
+/** Overload for callers that already hold the rows in a vector. */
+inline host_storage quantize(const std::vector<float>& data,
+                             int64_t n_rows,
+                             int64_t dim,
+                             uint8_t bits,
+                             cuvs::distance::DistanceType metric,
+                             bbq_code_layout layout = bbq_code_layout::unsigned_byte)
+{
+  return quantize(data.data(), n_rows, dim, bits, metric, layout);
+}
+
 template <typename IdxT>
 auto copy_bbq_owning_storage_host_to_device(
   raft::resources const& res,
@@ -376,19 +387,13 @@ inline void validate_bits(uint32_t query_bits, uint32_t doc_bits)
   (void)layout_for_bits(query_bits);
   (void)layout_for_bits(doc_bits);
   if (query_bits == doc_bits) { return; }
-  const bool supported = (query_bits == 2 && doc_bits == 1) ||
-                         (query_bits == 4 && doc_bits == 1) || (query_bits == 4 && doc_bits == 2);
+  const bool supported = (query_bits == 2 && doc_bits == 1) || (query_bits == 4 && doc_bits == 1) ||
+                         (query_bits == 4 && doc_bits == 2);
   RAFT_EXPECTS(supported,
                "Asymmetric BBQ NN-Descent supports only (query_bits, doc_bits) of (2, 1), (4, 1) "
                "or (4, 2); got (%u, %u).",
                query_bits,
                doc_bits);
-}
-
-inline auto cache_dir() -> std::string
-{
-  const char* dir = std::getenv("CUVS_BBQ_CACHE_DIR");
-  return (dir != nullptr && dir[0] != '\0') ? std::string{dir} : std::string{"/tmp"};
 }
 
 /** Every parameter that affects the codes is in the name, so the cache self-invalidates. */
@@ -398,18 +403,43 @@ inline auto cache_path(int64_t n_rows,
                        bbq_code_layout layout,
                        cuvs::distance::DistanceType metric) -> std::string
 {
-  return cache_dir() + "/bbq-n" + std::to_string(n_rows) + "-d" + std::to_string(dim) + "-b" +
-         std::to_string(bits) + "-l" + std::to_string(static_cast<int>(layout)) + "-m" +
+  const char* dir = std::getenv("CUVS_BBQ_CACHE_DIR");
+  return std::string{dir != nullptr && dir[0] != '\0' ? dir : "/tmp"} + "/bbq-n" +
+         std::to_string(n_rows) + "-d" + std::to_string(dim) + "-b" + std::to_string(bits) + "-l" +
+         std::to_string(static_cast<int>(layout)) + "-m" +
          std::to_string(static_cast<int>(metric)) + ".bin";
 }
 
-inline auto cache_bytes(int64_t n_rows, int64_t dim, uint32_t bits, bbq_code_layout layout) -> size_t
+/** Visits every raw buffer of @p q in a fixed order; this is the on-disk layout. */
+template <typename OpT>
+void for_each_buffer(host_storage& q, OpT op)
 {
-  const auto rows = static_cast<size_t>(n_rows);
-  return rows * encoded_row_length(static_cast<size_t>(dim), bits, layout)  // codes
-         + rows * sizeof(float) * 3                   // lower / upper / additional corrections
-         + rows * sizeof(int32_t)                     // quantized component sums
-         + static_cast<size_t>(dim) * sizeof(float);  // centroid
+  op(q.codes.data_handle(), q.codes.size() * sizeof(uint8_t));
+  op(q.lower_intervals.data_handle(), q.lower_intervals.size() * sizeof(float));
+  op(q.upper_intervals.data_handle(), q.upper_intervals.size() * sizeof(float));
+  op(q.additional_corrections.data_handle(), q.additional_corrections.size() * sizeof(float));
+  op(q.quantized_component_sums.data_handle(), q.quantized_component_sums.size() * sizeof(int32_t));
+  op(q.centroid.data_handle(), q.centroid.size() * sizeof(float));
+}
+
+/** Allocates the arrays of the given shape, leaving their contents undefined. */
+inline auto make_host_storage(int64_t n_rows,
+                              int64_t dim,
+                              uint32_t bits,
+                              bbq_code_layout layout,
+                              cuvs::distance::DistanceType metric) -> host_storage
+{
+  return host_storage{raft::make_host_matrix<uint8_t, int64_t>(
+                        n_rows, static_cast<int64_t>(encoded_row_length(dim, bits, layout))),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<int32_t, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(dim),
+                      bits,
+                      layout,
+                      metric,
+                      0.0f};
 }
 
 /** Reads the codes back if the file is present and has exactly the expected length. */
@@ -422,56 +452,30 @@ inline auto cache_load(const std::string& path,
 {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) { return std::nullopt; }
-  const auto expected = static_cast<std::streamoff>(cache_bytes(n_rows, dim, bits, layout));
-  if (f.tellg() != expected) {
+  auto q               = make_host_storage(n_rows, dim, bits, layout, metric);
+  std::streamoff bytes = 0;
+  for_each_buffer(q, [&bytes](void*, size_t n) { bytes += static_cast<std::streamoff>(n); });
+  if (f.tellg() != bytes) {
     RAFT_LOG_WARN("Ignoring BBQ cache of unexpected size: %s", path.c_str());
     return std::nullopt;
   }
   f.seekg(0);
-
-  const auto row_length         = static_cast<int64_t>(encoded_row_length(dim, bits, layout));
-  auto codes                    = raft::make_host_matrix<uint8_t, int64_t>(n_rows, row_length);
-  auto lower_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
-  auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
-  auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
-  auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
-  auto centroid                 = raft::make_host_vector<float, int64_t>(dim);
-
-  auto get = [&f](void* p, size_t bytes) {
-    f.read(static_cast<char*>(p), static_cast<std::streamsize>(bytes));
-  };
-  get(codes.data_handle(), codes.size() * sizeof(uint8_t));
-  get(lower_intervals.data_handle(), lower_intervals.size() * sizeof(float));
-  get(upper_intervals.data_handle(), upper_intervals.size() * sizeof(float));
-  get(additional_corrections.data_handle(), additional_corrections.size() * sizeof(float));
-  get(quantized_component_sums.data_handle(), quantized_component_sums.size() * sizeof(int32_t));
-  get(centroid.data_handle(), centroid.size() * sizeof(float));
+  for_each_buffer(
+    q, [&f](void* p, size_t n) { f.read(static_cast<char*>(p), static_cast<std::streamsize>(n)); });
   if (!f) {
     RAFT_LOG_WARN("Failed to read BBQ cache, re-quantizing: %s", path.c_str());
     return std::nullopt;
   }
-
   // Cheaper to recompute than to store and validate.
-  float centroid_norm_sq = 0.0f;
   for (int64_t d = 0; d < dim; ++d) {
-    centroid_norm_sq += centroid(d) * centroid(d);
+    q.centroid_norm_sq += q.centroid(d) * q.centroid(d);
   }
-
   RAFT_LOG_INFO("Loaded BBQ codes from %s", path.c_str());
-  return host_storage{std::move(codes),
-                      std::move(lower_intervals),
-                      std::move(upper_intervals),
-                      std::move(additional_corrections),
-                      std::move(quantized_component_sums),
-                      std::move(centroid),
-                      bits,
-                      layout,
-                      metric,
-                      centroid_norm_sq};
+  return q;
 }
 
 /** Writes via a temporary so an interrupted run cannot leave a truncated cache behind. */
-inline void cache_store(const std::string& path, const host_storage& q)
+inline void cache_store(const std::string& path, host_storage& q)
 {
   const std::string tmp = path + ".tmp";
   {
@@ -480,16 +484,9 @@ inline void cache_store(const std::string& path, const host_storage& q)
       RAFT_LOG_WARN("Cannot write BBQ cache: %s", tmp.c_str());
       return;
     }
-    auto put = [&f](const void* p, size_t bytes) {
-      f.write(static_cast<const char*>(p), static_cast<std::streamsize>(bytes));
-    };
-    put(q.codes.data_handle(), q.codes.size() * sizeof(uint8_t));
-    put(q.lower_intervals.data_handle(), q.lower_intervals.size() * sizeof(float));
-    put(q.upper_intervals.data_handle(), q.upper_intervals.size() * sizeof(float));
-    put(q.additional_corrections.data_handle(), q.additional_corrections.size() * sizeof(float));
-    put(q.quantized_component_sums.data_handle(),
-        q.quantized_component_sums.size() * sizeof(int32_t));
-    put(q.centroid.data_handle(), q.centroid.size() * sizeof(float));
+    for_each_buffer(q, [&f](void* p, size_t n) {
+      f.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
+    });
     if (!f) {
       RAFT_LOG_WARN("Failed to write BBQ cache: %s", tmp.c_str());
       f.close();

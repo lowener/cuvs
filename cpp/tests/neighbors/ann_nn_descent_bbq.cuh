@@ -31,6 +31,7 @@ namespace cuvs::neighbors::nn_descent {
 // The host reference quantizer is shared with the ann-bench CAGRA wrapper, so these tests and
 // the benchmark can never disagree about the code format.
 namespace cpu_bbq = cuvs_internal::bbq;
+using cuvs_internal::bbq::make_device_bbq_dataset;
 
 // CUDA-event elapsed time around @p fn on @p stream. Because the stop event is
 // recorded only after @p fn returns, stream-idle gaps from host work inside NN-Descent
@@ -123,22 +124,18 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
       raft::resource::sync_stream(handle_);
 
       auto bbq_host_storage =
-        cpu_bbq::quantize(host_data.data(), ps.n_rows, ps.dim, ps.bits, ps.metric, ps.layout);
+        cpu_bbq::quantize(host_data, ps.n_rows, ps.dim, ps.bits, ps.metric, ps.layout);
       auto bbq_host = cuvs::neighbors::host_bbq_dataset<int64_t>{std::move(bbq_host_storage)};
 
       if (ps.second_dataset_bits.has_value()) {
         auto second_layout           = ps.second_dataset_bits.value() == 1
                                          ? cuvs::preprocessing::quantize::bbq::bbq_code_layout::single_bit
                                          : cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit;
-        auto bbq_host_second_storage = cpu_bbq::quantize(host_data.data(),
-                                                         ps.n_rows,
-                                                         ps.dim,
-                                                         ps.second_dataset_bits.value(),
-                                                         ps.metric,
-                                                         second_layout);
+        auto bbq_host_second_storage = cpu_bbq::quantize(
+          host_data, ps.n_rows, ps.dim, ps.second_dataset_bits.value(), ps.metric, second_layout);
         bbq_host.add_quantizer(std::move(bbq_host_second_storage));
       }
-      auto owning_dataset = cpu_bbq::make_device_bbq_dataset(handle_, bbq_host);
+      auto owning_dataset = make_device_bbq_dataset(handle_, bbq_host);
       auto dataset        = owning_dataset.as_dataset_view();
       nn_descent::index_params index_params;
       index_params.metric                    = ps.metric;

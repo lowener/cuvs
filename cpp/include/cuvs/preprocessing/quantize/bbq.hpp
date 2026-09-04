@@ -77,7 +77,7 @@ struct bbq_quantizer {
                 uint32_t bits,
                 bbq_code_layout layout,
                 cuvs::distance::DistanceType metric,
-                float centroid_norm_sq) noexcept
+                float centroid_norm_sq)
     : codes{std::move(codes)},
       lower_intervals{std::move(lower_intervals)},
       upper_intervals{std::move(upper_intervals)},
