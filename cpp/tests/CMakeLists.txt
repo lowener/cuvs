@@ -41,6 +41,7 @@ function(ConfigureTest)
     ${TEST_NAME}
     PRIVATE cuvs
             cuvs::cuvs
+            cuvs_internal
             raft::raft
             rtcx::rtcx
             GTest::gtest

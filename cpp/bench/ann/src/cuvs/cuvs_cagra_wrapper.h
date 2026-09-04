@@ -18,6 +18,7 @@
 #include <cuvs/neighbors/ivf_pq.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
+#include <cuvs_internal/preprocessing/bbq_cpu_quantize.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/core/logger.hpp>
@@ -165,6 +166,12 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
     using dataset_dependent_params = std::function<cuvs::neighbors::cagra::index_params(
       raft::matrix_extent<int64_t>, cuvs::distance::DistanceType)>;
     dataset_dependent_params cagra_params;
+    /** Prototype: run the NN-Descent graph build on BBQ codes of these widths. */
+    struct bbq_param {
+      uint32_t query_bits;
+      uint32_t doc_bits;
+    };
+    std::optional<bbq_param> bbq                           = std::nullopt;
     std::optional<cuvs::neighbors::vpq_params> compression = std::nullopt;
     size_t num_dataset_splits                              = 1;
     CagraMergeType merge_type                              = CagraMergeType::kPhysical;
@@ -236,6 +243,11 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   /** Train the VPQ codebooks and create the CAGRA-Q index sharing the graph of `index_`. */
   void compress_dataset(const T* dataset, size_t nrow);
 
+  /** Prototype: run the NN-Descent graph build on BBQ codes instead of the dense rows. */
+  void build_bbq_nn_descent(const T* dataset,
+                            size_t nrow,
+                            const cuvs::neighbors::cagra::index_params& params);
+
   // handle_ must go first to make sure it dies last and all memory allocated in pool
   configured_raft_resources handle_{};
   rmm::mr::pinned_host_memory_resource mr_pinned_;
@@ -281,10 +293,63 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 };
 
 template <typename T, typename IdxT>
+void cuvs_cagra<T, IdxT>::build_bbq_nn_descent(
+  const T* dataset, size_t nrow, const cuvs::neighbors::cagra::index_params& params)
+{
+  using nn_descent_params = cuvs::neighbors::cagra::graph_build_params::nn_descent_params;
+  if (!std::holds_alternative<nn_descent_params>(params.graph_build_params)) {
+    throw std::runtime_error("nn_descent_bbq_* requires graph_build_algo=NN_DESCENT");
+  }
+  // The public optimize() takes no such flag, so fail rather than ignore it.
+  if (params.guarantee_connectivity) {
+    throw std::runtime_error("nn_descent_bbq_* does not support guarantee_connectivity");
+  }
+  const auto n_rows = static_cast<int64_t>(nrow);
+  const auto metric = parse_metric_type(metric_);
+
+  // Quantize (or load the cached codes) before the graph build, so that NN-Descent sees the codes
+  // as just another device buffer. They are dropped again as soon as the kNN graph is out.
+  auto bbq_dataset = cuvs_internal::bbq::quantize_to_device(handle_,
+                                                            dataset,
+                                                            n_rows,
+                                                            static_cast<int64_t>(dim_),
+                                                            metric,
+                                                            index_params_.bbq->query_bits,
+                                                            index_params_.bbq->doc_bits);
+
+  // Mirrors what CAGRA does to the NN-Descent parameters on the dense path.
+  auto nnd_params = std::get<nn_descent_params>(params.graph_build_params);
+  if (nnd_params.graph_degree != params.intermediate_graph_degree) {
+    nnd_params = nn_descent_params(params.intermediate_graph_degree, metric);
+  }
+  nnd_params.metric           = metric;
+  nnd_params.return_distances = false;
+
+  auto knn_graph = raft::make_host_matrix<IdxT, int64_t>(
+    n_rows, static_cast<int64_t>(params.intermediate_graph_degree));
+  cuvs::neighbors::nn_descent::build(
+    handle_, nnd_params, bbq_dataset.as_dataset_view(), knn_graph.view());
+
+  auto cagra_graph =
+    raft::make_host_matrix<IdxT, int64_t>(n_rows, static_cast<int64_t>(params.graph_degree));
+  cuvs::neighbors::cagra::helpers::optimize(handle_, knn_graph.view(), cagra_graph.view());
+
+  // As on the host path: the index keeps the graph only and set_search_param uploads the rows.
+  index_ = std::make_shared<index_type>(handle_, params.metric);
+  index_->update_graph(handle_, raft::make_const_mdspan(cagra_graph.view()));
+}
+
+template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
 {
   auto dataset_extents = raft::make_extents<int64_t>(nrow, dim_);
   auto params          = index_params_.cagra_params(dataset_extents, parse_metric_type(metric_));
+  if constexpr (std::is_same_v<T, float>) {
+    if (index_params_.bbq.has_value()) {
+      build_bbq_nn_descent(dataset, nrow, params);
+      return;
+    }
+  }
   // The host paths keep the graph only, so the index need not hold a view of the caller's rows.
   auto host_params                    = params;
   host_params.attach_dataset_on_build = false;
