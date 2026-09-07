@@ -174,18 +174,19 @@ inline row_result scalar_quantize(std::vector<float>& vector,
 inline size_t encoded_row_length(size_t dim, uint32_t bits, bbq_code_layout layout)
 {
   switch (layout) {
-    case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
-    case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
-    case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
-    case bbq_code_layout::seven_bit: return dim;
-    case bbq_code_layout::unsigned_byte: return dim;
-    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
+    case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
+    case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
+    case bbq_code_layout::packed_2b: return (dim + 3) / 4;
+    case bbq_code_layout::packed_4b: return (dim + 1) / 2;
+    case bbq_code_layout::packed_7b: return dim;
+    case bbq_code_layout::packed_8b: return dim;
+    case bbq_code_layout::transposed_4b: return 4 * ((dim + 7) / 8);
   }
   return 0;
 }
 
-// Packs one-byte-per-component codes into single_bit / dibit / packed_nibble /
-// transpose_half_byte (or leaves unpacked). Matches Lucene packAsBinary,
+// Packs one-byte-per-component codes into packed_1b / packed_2b / transposed_2b /
+// packed_4b / transposed_4b (or leaves unpacked). Matches Lucene packAsBinary,
 // packNibbles, transposeDibit, transposeHalfByte.
 inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
                                        size_t n_rows,
@@ -194,7 +195,7 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
                                        bbq_code_layout layout)
 {
   const size_t row_length = encoded_row_length(dim, bits, layout);
-  if (layout == bbq_code_layout::unsigned_byte || layout == bbq_code_layout::seven_bit) {
+  if (layout == bbq_code_layout::packed_8b || layout == bbq_code_layout::packed_7b) {
     return unpacked;
   }
 
@@ -203,7 +204,7 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
   for (int64_t row = 0; row < static_cast<int64_t>(n_rows); ++row) {
     auto* output      = packed.data() + static_cast<size_t>(row) * row_length;
     const auto* input = unpacked.data() + static_cast<size_t>(row) * dim;
-    if (layout == bbq_code_layout::packed_nibble) {
+    if (layout == bbq_code_layout::packed_4b) {
       // Lucene OffHeapScalarQuantizedVectorValues.packNibbles
       const size_t half = dim / 2;
       for (size_t i = 0; i < half; ++i) {
@@ -211,16 +212,26 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
       }
       continue;
     }
+    if (layout == bbq_code_layout::packed_2b) {
+      // Dense 2-bit: four consecutive dimensions per byte, most significant
+      // first. Not a bit-plane layout, so it must not fall through below.
+      const size_t quads = dim / 4;
+      for (size_t i = 0; i < quads; ++i) {
+        output[i] = static_cast<uint8_t>((input[4 * i] << 6) | (input[4 * i + 1] << 4) |
+                                         (input[4 * i + 2] << 2) | input[4 * i + 3]);
+      }
+      continue;
+    }
     for (size_t d = 0; d < dim; ++d) {
       const uint8_t code = input[d];
-      if (layout == bbq_code_layout::single_bit) {
+      if (layout == bbq_code_layout::packed_1b) {
         for (uint32_t bit = 0; bit < bits; ++bit) {
           const size_t position = d * bits + bit;
           output[position / 8] |=
             static_cast<uint8_t>(((code >> (bits - 1 - bit)) & 1u) << (7 - position % 8));
         }
       } else {
-        // dibit / transpose_half_byte bit-planes (LSB plane first)
+        // transposed_2b / transposed_4b bit-planes (LSB plane first)
         const size_t stripe = (dim + 7) / 8;
         for (uint32_t bit = 0; bit < bits; ++bit) {
           output[bit * stripe + d / 8] |= static_cast<uint8_t>(((code >> bit) & 1u) << (7 - d % 8));
@@ -236,7 +247,7 @@ inline host_storage quantize(const float* data,
                              int64_t dim,
                              uint8_t bits,
                              cuvs::distance::DistanceType metric,
-                             bbq_code_layout layout = bbq_code_layout::unsigned_byte)
+                             bbq_code_layout layout = bbq_code_layout::packed_8b)
 {
   const bool euclidean = metric == cuvs::distance::DistanceType::L2Expanded ||
                          metric == cuvs::distance::DistanceType::L2SqrtExpanded;
@@ -296,7 +307,7 @@ inline host_storage quantize(const std::vector<float>& data,
                              int64_t dim,
                              uint8_t bits,
                              cuvs::distance::DistanceType metric,
-                             bbq_code_layout layout = bbq_code_layout::unsigned_byte)
+                             bbq_code_layout layout = bbq_code_layout::packed_8b)
 {
   return quantize(data.data(), n_rows, dim, bits, metric, layout);
 }
@@ -369,11 +380,11 @@ auto make_device_bbq_dataset(raft::resources const& res,
 inline auto layout_for_bits(uint32_t bits) -> bbq_code_layout
 {
   switch (bits) {
-    case 1: return bbq_code_layout::single_bit;
-    case 2: return bbq_code_layout::dibit;
-    case 4: return bbq_code_layout::transpose_half_byte;
-    case 7: return bbq_code_layout::seven_bit;
-    case 8: return bbq_code_layout::unsigned_byte;
+    case 1: return bbq_code_layout::packed_1b;
+    case 2: return bbq_code_layout::transposed_2b;
+    case 4: return bbq_code_layout::transposed_4b;
+    case 7: return bbq_code_layout::packed_7b;
+    case 8: return bbq_code_layout::packed_8b;
     default: RAFT_FAIL("BBQ bits must be one of 1, 2, 4, 7 or 8; got %u.", bits);
   }
 }
