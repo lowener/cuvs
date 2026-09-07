@@ -7,6 +7,7 @@
 
 #include <cuvs/preprocessing/quantize/bbq.hpp>
 
+#include <raft/core/copy.cuh>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
@@ -249,10 +250,10 @@ inline cuvs::preprocessing::quantize::bbq::bbq_quantizer<DataT, int64_t> quantiz
   }
 
   std::vector<uint8_t> unpacked(static_cast<size_t>(n_rows * dim));
-  auto lower_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
-  auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
-  auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
-  auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
+  auto lower_intervals            = raft::make_host_vector<float, int64_t>(n_rows);
+  auto upper_intervals            = raft::make_host_vector<float, int64_t>(n_rows);
+  auto additional_corrections     = raft::make_host_vector<float, int64_t>(n_rows);
+  auto quantized_component_sums   = raft::make_host_vector<int32_t, int64_t>(n_rows);
   auto lower_intervals_d          = raft::make_device_vector<float, int64_t>(res, n_rows);
   auto upper_intervals_d          = raft::make_device_vector<float, int64_t>(res, n_rows);
   auto additional_corrections_d   = raft::make_device_vector<float, int64_t>(res, n_rows);
@@ -273,7 +274,10 @@ inline cuvs::preprocessing::quantize::bbq::bbq_quantizer<DataT, int64_t> quantiz
     pack_codes(unpacked, static_cast<size_t>(n_rows), static_cast<size_t>(dim), bits, layout);
   auto codes = raft::make_device_matrix<uint8_t, int64_t, raft::layout_c_contiguous>(
     res, n_rows, static_cast<int64_t>(encoded_row_length(dim, bits, layout)));
-  raft::copy(codes.data_handle(), packed.data(), codes.extent(0) * codes.extent(1), raft::resource::get_cuda_stream(res));
+  raft::copy(codes.data_handle(),
+             packed.data(),
+             codes.extent(0) * codes.extent(1),
+             raft::resource::get_cuda_stream(res));
   raft::copy(res, lower_intervals_d.view(), lower_intervals.view());
   raft::copy(res, upper_intervals_d.view(), upper_intervals.view());
   raft::copy(res, additional_corrections_d.view(), additional_corrections.view());
