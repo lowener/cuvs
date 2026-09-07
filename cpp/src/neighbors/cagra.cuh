@@ -46,7 +46,8 @@ CUVS_EXPORT void index<T, IdxT, DatasetViewT>::compute_dataset_norms_(raft::reso
   if constexpr (nb::is_padded_dataset_view_v<DatasetViewT> ||
                 nb::is_standard_dataset_view_v<DatasetViewT>) {
     rm_dataset = dataset_.view();
-  } else if constexpr (nb::is_vpq_dataset_view_v<DatasetViewT>) {
+  } else if constexpr (nb::is_vpq_dataset_view_v<DatasetViewT> ||
+                       nb::is_bbq_dataset_view_v<DatasetViewT>) {
     skip_norms = true;
   }
 
@@ -301,7 +302,10 @@ auto build(raft::resources const& res, const index_params& params, DatasetViewT 
 
   // Dense paths build the graph and optionally attach the input dataset view. Host indexes remain
   // non-searchable until the type-changing update_dataset(...) supplies a device-padded dataset.
-  if constexpr (cuvs::neighbors::is_device_vpq_dataset_view_v<DatasetViewT>) {
+  if constexpr (cuvs::neighbors::is_device_bbq_dataset_view_v<DatasetViewT>) {
+    return cuvs::neighbors::cagra::detail::build_from_bbq_dataset<T, IdxT, DatasetViewT>(
+      res, params, dataset);
+  } else if constexpr (cuvs::neighbors::is_device_vpq_dataset_view_v<DatasetViewT>) {
     RAFT_FAIL("cagra::build: VPQ-compressed dataset cannot be used for dense graph construction.");
   } else if constexpr (cuvs::neighbors::is_dense_row_major_device_dataset_view_v<DatasetViewT>) {
     auto idx = cuvs::neighbors::cagra::detail::build_from_device_matrix<T, IdxT, DatasetViewT>(

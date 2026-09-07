@@ -34,8 +34,8 @@ enum class bbq_code_layout {
   packed_1b,     /** Each dimension is quantized to a single bit and packed into bytes. Reflects
                   * Lucene's OptimizedScalarQuantizer.packAsBinary. */
   transposed_2b, /** Each dimension is quantized to 2 bits, stored as 2 bitplanes.
-                  * Reflects Lucene's OptimizedScalarQuantizer.transposeDibit. SIMT popc path only (paired
-                  * with a transposed_4b or packed_1b operand); */
+                  * Reflects Lucene's OptimizedScalarQuantizer.transposeDibit. SIMT popc path only
+                  * (paired with a transposed_4b or packed_1b operand); */
   transposed_4b, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
                   * Reflects Lucene's OptimizedScalarQuantizer.transposeHalfByte. the first bit of
                   * every dimension is in the first set dimensions bits, or (dimensions/8)
@@ -57,10 +57,10 @@ struct bbq_quantizer {
   raft::device_mdarray<int32_t, raft::vector_extent<IdxT>> quantized_component_sums;
   raft::device_mdarray<DataT, raft::vector_extent<IdxT>> centroid;
   /** Precomputed per-row dequantization factors, derived once (offline) from lower/upper_intervals
-  * and quantized_component_sums: dequant_delta = (upper-lower)/(2^bits-1) */
+   * and quantized_component_sums: dequant_delta = (upper-lower)/(2^bits-1) */
   raft::device_mdarray<float, raft::vector_extent<IdxT>> dequant_delta;
-  /** Precomputed per-row dequantization factors, derived once (offline) from dequant_delta and quantized_component_sums:
-  * dequant_sum_delta = dequant_delta * quantized_component_sums. */
+  /** Precomputed per-row dequantization factors, derived once (offline) from dequant_delta and
+   * quantized_component_sums: dequant_sum_delta = dequant_delta * quantized_component_sums. */
   raft::device_mdarray<float, raft::vector_extent<IdxT>> dequant_sum_delta;
   /** Squared norm of the row in original (un-centered) vector space, ||x||^2 */
   raft::device_mdarray<float, raft::vector_extent<IdxT>> row_norm;
@@ -70,19 +70,20 @@ struct bbq_quantizer {
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
-  bbq_quantizer(raft::device_mdarray<uint8_t, raft::matrix_extent<IdxT>>&& codes_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& lower_intervals_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& upper_intervals_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& additional_corrections_,
-                raft::device_mdarray<int32_t, raft::vector_extent<IdxT>>&& quantized_component_sums_,
-                raft::device_mdarray<DataT, raft::vector_extent<IdxT>>&& centroid_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_delta_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_sum_delta_,
-                raft::device_mdarray<float, raft::vector_extent<IdxT>>&& row_norm_,
-                uint32_t bits,
-                bbq_code_layout layout,
-                cuvs::distance::DistanceType metric,
-                float centroid_norm_sq)
+  bbq_quantizer(
+    raft::device_mdarray<uint8_t, raft::matrix_extent<IdxT>>&& codes_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& lower_intervals_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& upper_intervals_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& additional_corrections_,
+    raft::device_mdarray<int32_t, raft::vector_extent<IdxT>>&& quantized_component_sums_,
+    raft::device_mdarray<DataT, raft::vector_extent<IdxT>>&& centroid_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_delta_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_sum_delta_,
+    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& row_norm_,
+    uint32_t bits,
+    bbq_code_layout layout,
+    cuvs::distance::DistanceType metric,
+    float centroid_norm_sq)
     : codes{std::move(codes_)},
       lower_intervals{std::move(lower_intervals_)},
       upper_intervals{std::move(upper_intervals_)},
@@ -131,13 +132,19 @@ template <typename DataT, typename IdxT>
 struct bbq_quantizer_view {
   using owning_storage = bbq_quantizer<DataT, IdxT>;
   raft::device_mdspan<const uint8_t, raft::matrix_extent<IdxT>, raft::layout_c_contiguous> codes;
-  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> lower_intervals;
-  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> upper_intervals;
-  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> additional_corrections;
-  raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous> quantized_component_sums;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    lower_intervals;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    upper_intervals;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    additional_corrections;
+  raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    quantized_component_sums;
   raft::device_mdspan<const DataT, raft::vector_extent<IdxT>, raft::layout_c_contiguous> centroid;
-  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> dequant_delta;
-  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> dequant_sum_delta;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    dequant_delta;
+  raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+    dequant_sum_delta;
   raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> row_norm;
 
   uint32_t bits{};
@@ -147,14 +154,22 @@ struct bbq_quantizer_view {
 
   bbq_quantizer_view(
     raft::device_mdspan<const uint8_t, raft::matrix_extent<IdxT>, raft::layout_c_contiguous> codes_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> lower_intervals_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> upper_intervals_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> additional_corrections_,
-    raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous> quantized_component_sums_,
-    raft::device_mdspan<const DataT, raft::vector_extent<IdxT>, raft::layout_c_contiguous> centroid_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> dequant_delta_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> dequant_sum_delta_,
-    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous> row_norm_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      lower_intervals_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      upper_intervals_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      additional_corrections_,
+    raft::device_mdspan<const int32_t, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      quantized_component_sums_,
+    raft::device_mdspan<const DataT, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      centroid_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      dequant_delta_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      dequant_sum_delta_,
+    raft::device_mdspan<const float, raft::vector_extent<IdxT>, raft::layout_c_contiguous>
+      row_norm_,
     uint32_t bits_,
     bbq_code_layout layout_,
     cuvs::distance::DistanceType metric_,
@@ -202,7 +217,6 @@ struct bbq_quantizer_view {
 template <typename DataT, typename IdxT>
 using device_bbq_quantizer_view = bbq_quantizer_view<DataT, IdxT>;
 
-
 namespace helpers {
 /** Derives dequant_delta from lower/upper_intervals and bits. */
 auto resolve_dequant_delta(
@@ -211,13 +225,14 @@ auto resolve_dequant_delta(
   const raft::device_mdarray<float, raft::vector_extent<int64_t>>& upper_intervals,
   uint32_t bits) -> raft::device_mdarray<float, raft::vector_extent<int64_t>>;
 
-/** Derives dequant_sum_delta from the already resolved dequant_delta and quantized_component_sums. */
+/** Derives dequant_sum_delta from the already resolved dequant_delta and quantized_component_sums.
+ */
 auto resolve_dequant_sum_delta(
   raft::resources& res,
   const raft::device_mdarray<float, raft::vector_extent<int64_t>>& dequant_delta,
   const raft::device_mdarray<int32_t, raft::vector_extent<int64_t>>& quantized_component_sums)
   -> raft::device_mdarray<float, raft::vector_extent<int64_t>>;
-} // namespace helpers
+}  // namespace helpers
 /** @} */  // end of bbq group
 
 }  // namespace preprocessing::quantize::bbq
@@ -227,8 +242,7 @@ struct bbq_dataset_container {
   template <typename DataT, typename IdxT>
   using owning_storage = cuvs::preprocessing::quantize::bbq::bbq_quantizer<DataT, IdxT>;
   template <typename DataT, typename IdxT>
-  using view_storage =
-    cuvs::preprocessing::quantize::bbq::bbq_quantizer_view<DataT, IdxT>;
+  using view_storage = cuvs::preprocessing::quantize::bbq::bbq_quantizer_view<DataT, IdxT>;
 };
 
 template <typename DataT, typename IdxT, typename Accessor>
@@ -276,8 +290,10 @@ struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
 template <typename DataT, typename IdxT, typename Accessor>
 struct dataset_view<bbq_dataset_container, DataT, IdxT, Accessor> {
   using owning_storage_type = bbq_dataset_container::owning_storage<DataT, IdxT>;
-  using view_storage_type = bbq_dataset_container::view_storage<DataT, IdxT>;
+  using view_storage_type   = bbq_dataset_container::view_storage<DataT, IdxT>;
   std::vector<view_storage_type> quantizers;
+
+  dataset_view() noexcept = default;
 
   dataset_view(const std::vector<owning_storage_type>& quantizers) noexcept
   {
@@ -350,6 +366,12 @@ template <typename DataT, typename IdxT, typename Accessor>
 struct dataset_view_kind_of<dataset_view<bbq_dataset_container, DataT, IdxT, Accessor>> {
   static constexpr dataset_view_kind value = dataset_view_kind::bbq;
 };
+
+template <typename DataT, typename IdxT>
+struct cagra_view_element_type<device_bbq_dataset_view<DataT, IdxT>> {
+  using type = DataT;
+};
+
 template <typename V>
 inline constexpr bool is_device_bbq_dataset_view_v =
   dataset_view_kind_v<V> == dataset_view_kind::bbq && dataset_view_is_device_accessible_v<V>;

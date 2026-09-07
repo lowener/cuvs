@@ -1166,59 +1166,14 @@ __launch_bounds__(BLOCK_SIZE)
 // Quantized-code joins: SIMT (popc / dp4a) and int4 tensor core (u4 wmma).
 // --------------------------------------------------------------------------
 
-// Per-row dequantization terms needed by bbq_calculate_metric.
-// row_norm is read directly from the quantizer view instead,
-// since register pressure in the BBQ local-join kernels is already tight.
-struct bbq_dequant_factors {
-  float lower;
-  float delta;
-  float sum_delta;
-  float corrections;
-};
-
-// Converts one raw BBQ dot product into a final (post-epilogue) float distance, given both
-// operands' precomputed dequant factors. Evaluated exactly once per matrix cell
-// dim/centroid_norm_sq/row_norm both come directly from quantizer_document/quantizer_query rather
-// than being passed separately, since every caller reads them the same id-indexed way -- row_norm
-// is only read for CosineExpanded (skipped entirely otherwise).
-template <typename DataT, typename Index_t, typename DistEpilogue_t>
-__device__ __forceinline__ float bbq_calculate_metric(
-  uint32_t raw,
-  const bbq_dequant_factors& doc_factors,
-  const bbq_dequant_factors& query_factors,
-  const device_bbq_quantizer_view<DataT, int64_t>& quantizer_document,
-  const device_bbq_quantizer_view<DataT, int64_t>& quantizer_query,
-  cuvs::distance::DistanceType metric,
-  DistEpilogue_t dist_epilogue,
-  Index_t document_id,
-  Index_t query_id)
-{
-  constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
-  const float dim                     = static_cast<float>(quantizer_document.dim());
-
-  const float centered = dim * doc_factors.lower * query_factors.lower +
-                         query_factors.lower * doc_factors.sum_delta +
-                         doc_factors.lower * query_factors.sum_delta +
-                         doc_factors.delta * query_factors.delta * static_cast<float>(raw);
-  const float corrections = doc_factors.corrections + query_factors.corrections;
-  float d;
-  if (metric == cuvs::distance::DistanceType::L2Expanded ||
-      metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-    const float raw_distance = corrections - 2.0f * centered;
-    d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
-    if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-      d = sqrtf(d);
-    }
-  } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-    d = -(centered + corrections - quantizer_document.centroid_norm_sq);
-  } else {  // CosineExpanded
-    const float norm_product =
-      quantizer_document.row_norm(document_id) * quantizer_query.row_norm(query_id);
-    const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
-    d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
-  }
-  return dist_epilogue(d, document_id, query_id);
-}
+// The code promotion, the dequant factors and the raw-dot-product-to-distance conversion live
+// next to the code inner products in bbq.cuh, so the CAGRA graph sort ranks by the very same
+// distance these kernels build the lists with.
+using cuvs::preprocessing::quantize::bbq::bbq_calculate_metric;
+using cuvs::preprocessing::quantize::bbq::bbq_dequant_factors;
+using cuvs::preprocessing::quantize::bbq::get_dequant_factors;
+using cuvs::preprocessing::quantize::bbq::promote_packed_1b_word_to_4b;
+using cuvs::preprocessing::quantize::bbq::promote_word_to_4b;
 
 // Stages one tile of `count` rows into a SIMT shared-memory buffer, zero-padding a short last
 // tile. The SIMT counterpart of stage_promoted_tile: it folds the same warp-strided row loop,
@@ -1318,13 +1273,9 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                              cuvs::distance::DistanceType metric,
                              DistEpilogue_t dist_epilogue)
 {
-  // Plane count per layout: the transposed layouts are bit-sliced into `N` planes, the packed
-  // ones are a single dense plane. This is the only thing the tiling needs from the layout.
-  constexpr auto planes_of = [](bbq_layout l) {
-    return l == bbq_layout::transposed_2b ? 2 : l == bbq_layout::transposed_4b ? 4 : 1;
-  };
-  constexpr int document_planes = planes_of(DocumentLayout);
-  constexpr int query_planes    = planes_of(QueryLayout);
+  constexpr int document_planes =
+    cuvs::preprocessing::quantize::bbq::get_code_planes(DocumentLayout);
+  constexpr int query_planes = cuvs::preprocessing::quantize::bbq::get_code_planes(QueryLayout);
   static_assert(!SelfJoin || DocumentLayout == QueryLayout,
                 "a self-join must use the same layout on both operands");
 
@@ -1409,11 +1360,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 
   // Rows are always new_neighbors/document in both phases below, so this runs exactly once.
   for (int i = tx; i < new_size; i += BLOCK_SIZE) {
-    const Index_t row                 = new_neighbors[i];
-    s_document_factors[i].lower       = dataset_document.lower_intervals(row);
-    s_document_factors[i].delta       = dataset_document.dequant_delta(row);
-    s_document_factors[i].sum_delta   = dataset_document.dequant_sum_delta(row);
-    s_document_factors[i].corrections = dataset_document.additional_corrections(row);
+    s_document_factors[i] = get_dequant_factors(dataset_document, new_neighbors[i]);
   }
   __syncthreads();
 
@@ -1467,11 +1414,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   const int my_col = tx % MAX_NUM_BI_SAMPLES;
   bbq_dequant_factors my_col_factors{};
   if (my_col < new_size) {
-    const Index_t q_row        = new_neighbors[my_col];
-    my_col_factors.lower       = dataset_query.lower_intervals(q_row);
-    my_col_factors.delta       = dataset_query.dequant_delta(q_row);
-    my_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
-    my_col_factors.corrections = dataset_query.additional_corrections(q_row);
+    my_col_factors = get_dequant_factors(dataset_query, new_neighbors[my_col]);
   }
 
   uint32_t acc0[pairs_per_thread] = {};
@@ -1614,11 +1557,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   const int my_old_col = tx % MAX_NUM_BI_SAMPLES;
   bbq_dequant_factors my_old_col_factors{};
   if (my_old_col < old_size) {
-    const Index_t q_row            = old_neighbors[my_old_col];
-    my_old_col_factors.lower       = dataset_query.lower_intervals(q_row);
-    my_old_col_factors.delta       = dataset_query.dequant_delta(q_row);
-    my_old_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
-    my_old_col_factors.corrections = dataset_query.additional_corrections(q_row);
+    my_old_col_factors = get_dequant_factors(dataset_query, old_neighbors[my_old_col]);
   }
 
   uint32_t acc0_old[pairs_per_thread] = {};
@@ -1748,46 +1687,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
-  }
-}
-
-// Promotes one native word of dense packed_1b codes (1 bit/value, 8 values/byte, MSB-first:
-// the value at position 8*byte+i sits at bit (7-i)) into four 4-bit-width, packed_4b-style
-// output words.
-//
-// Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise across all 4 native
-// bytes at once (field[j]'s byte i = field j of native byte i), spread each field 0-3 into a
-// nibble value lane-wise, then transpose the 4 resulting field-words into the 4 per-native-byte
-// output words with chained __byte_perm pairs (16 bits at a time, since one __byte_perm call
-// only reaches 2 of the 4 field-words). Equivalence with the straightforward
-// per-byte-extraction version verified exhaustively over random 32-bit inputs.
-__device__ __forceinline__ void promote_packed_1b_word_to_4b(uint32_t native_word, uint32_t out[4])
-{
-  uint32_t spread[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const uint32_t field = (native_word >> (6 - 2 * j)) & 0x03030303u;
-    spread[j]            = ((field & 0x02020202u) << 3) | (field & 0x01010101u);
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    // sel picks: out byte0 = spread[.]'s byte i (source index i), out byte1 = spread[.]'s byte
-    // i (source index 4+i, i.e. the second byte_perm operand); byte2/3 are don't-care (masked
-    // off below).
-    const uint32_t sel = 0x00000040u + i * 0x00000011u;
-    const uint32_t lo  = __byte_perm(spread[0], spread[1], sel);
-    const uint32_t hi  = __byte_perm(spread[2], spread[3], sel);
-    out[i]             = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
-  }
-}
-
-template <bbq_layout Layout>
-__device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_t* out)
-{
-  if constexpr (Layout == bbq_layout::packed_1b) {
-    promote_packed_1b_word_to_4b(native_word, out);
-  } else {
-    out[0] = native_word;  // packed_4b: already 4-bit-width
   }
 }
 
@@ -1957,7 +1856,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   static_assert(sizeof(s_distances) >= MAX_NUM_BI_SAMPLES * (BBQ_ROW_BYTES + MMA_PAD),
                 "s_col_vec aliases s_distances's memory and must fit inside it");
   auto(*s_col_vec)[BBQ_ROW_BYTES + MMA_PAD] =
-    reinterpret_cast<uint8_t(*)[BBQ_ROW_BYTES + MMA_PAD]>(s_distances);
+    reinterpret_cast<uint8_t (*)[BBQ_ROW_BYTES + MMA_PAD]>(s_distances);
   __shared__ int s_unique_counter[2];
   // Document-side (row axis) dequant factors -- see the identical buffer and full rationale in
   // local_join_kernel_bbq_simt. Staged once below, reused unchanged by both phases (rows are
@@ -2116,11 +2015,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int my_col = tx % MAX_NUM_BI_SAMPLES;
       bbq_dequant_factors my_col_factors{};
       if (my_col < col_size) {
-        const Index_t q_row        = col_neighbors[my_col];
-        my_col_factors.lower       = dataset_query.lower_intervals(q_row);
-        my_col_factors.delta       = dataset_query.dequant_delta(q_row);
-        my_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
-        my_col_factors.corrections = dataset_query.additional_corrections(q_row);
+        my_col_factors = get_dequant_factors(dataset_query, col_neighbors[my_col]);
       }
 
       // Cell (row, col) is read (as raw int, via this alias) and written (as the final float) at
@@ -2153,11 +2048,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   // Rows are always new_neighbors/document in both phases below, so this runs exactly once -- see
   // the identical staging and rationale in local_join_kernel_bbq_simt.
   for (int i = tx; i < new_size; i += BLOCK_SIZE) {
-    const Index_t row                 = new_neighbors[i];
-    s_document_factors[i].lower       = dataset_document.lower_intervals(row);
-    s_document_factors[i].delta       = dataset_document.dequant_delta(row);
-    s_document_factors[i].sum_delta   = dataset_document.dequant_sum_delta(row);
-    s_document_factors[i].corrections = dataset_document.additional_corrections(row);
+    s_document_factors[i] = get_dequant_factors(dataset_document, new_neighbors[i]);
   }
   __syncthreads();
 
@@ -2653,9 +2544,7 @@ void GNND<Data_t, Index_t>::local_join(
   // must be 4-byte aligned.
   {
     const auto len     = bbq::get_encoded_row_length(quantizer_query);
-    const int n_planes = quantizer_query.layout == L::transposed_2b   ? 2
-                         : quantizer_query.layout == L::transposed_4b ? 4
-                                                                      : 1;
+    const int n_planes = bbq::get_code_planes(quantizer_query.layout);
     RAFT_EXPECTS(len % (4u * static_cast<uint32_t>(n_planes)) == 0,
                  "BBQ local join requires the encoded row length to be a multiple of 4*n_planes "
                  "for 32-bit aligned plane loads, got %u with n_planes = %d",
