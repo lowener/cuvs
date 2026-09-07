@@ -274,6 +274,11 @@ inline host_storage quantize(const float* data,
   auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
   auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
   auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
+  // Per-row dequantization factors, derived here (offline, once) so centered_dot() on the device
+  // never has to re-derive them from lower/upper_intervals and quantized_component_sums.
+  auto dequant_delta        = raft::make_host_vector<float, int64_t>(n_rows);
+  auto dequant_sum_delta    = raft::make_host_vector<float, int64_t>(n_rows);
+  const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
 
 #pragma omp parallel for
   for (int64_t i = 0; i < n_rows; ++i) {
@@ -285,6 +290,9 @@ inline host_storage quantize(const float* data,
     upper_intervals(i)          = result.upper_interval;
     additional_corrections(i)   = result.additional_correction;
     quantized_component_sums(i) = result.quantized_component_sum;
+    const float delta           = (result.upper_interval - result.lower_interval) * dequant_scale;
+    dequant_delta(i)            = delta;
+    dequant_sum_delta(i)        = delta * static_cast<float>(result.quantized_component_sum);
   }
 
   auto packed =
@@ -299,6 +307,8 @@ inline host_storage quantize(const float* data,
                       std::move(additional_corrections),
                       std::move(quantized_component_sums),
                       std::move(centroid),
+                      std::move(dequant_delta),
+                      std::move(dequant_sum_delta),
                       static_cast<uint32_t>(bits),
                       layout,
                       metric,
@@ -334,6 +344,10 @@ auto copy_bbq_owning_storage_host_to_device(
   auto quantized_component_sums =
     raft::make_device_vector<int32_t, IdxT>(res, host_storage.quantized_component_sums.extent(0));
   auto centroid = raft::make_device_vector<float, IdxT>(res, host_storage.centroid.extent(0));
+  auto dequant_delta =
+    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_delta.extent(0));
+  auto dequant_sum_delta =
+    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_sum_delta.extent(0));
 
   raft::copy(codes.data_handle(), host_storage.codes.data_handle(), codes.size(), stream);
   raft::copy(lower_intervals.data_handle(),
@@ -353,6 +367,14 @@ auto copy_bbq_owning_storage_host_to_device(
              quantized_component_sums.size(),
              stream);
   raft::copy(centroid.data_handle(), host_storage.centroid.data_handle(), centroid.size(), stream);
+  raft::copy(dequant_delta.data_handle(),
+             host_storage.dequant_delta.data_handle(),
+             dequant_delta.size(),
+             stream);
+  raft::copy(dequant_sum_delta.data_handle(),
+             host_storage.dequant_sum_delta.data_handle(),
+             dequant_sum_delta.size(),
+             stream);
 
   return {std::move(codes),
           std::move(lower_intervals),
@@ -360,6 +382,8 @@ auto copy_bbq_owning_storage_host_to_device(
           std::move(additional_corrections),
           std::move(quantized_component_sums),
           std::move(centroid),
+          std::move(dequant_delta),
+          std::move(dequant_sum_delta),
           host_storage.bits,
           host_storage.layout,
           host_storage.metric,
@@ -451,6 +475,8 @@ inline auto make_host_storage(int64_t n_rows,
                       raft::make_host_vector<float, int64_t>(n_rows),
                       raft::make_host_vector<int32_t, int64_t>(n_rows),
                       raft::make_host_vector<float, int64_t>(dim),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(n_rows),
                       bits,
                       layout,
                       metric,
@@ -481,9 +507,17 @@ inline auto cache_load(const std::string& path,
     RAFT_LOG_WARN("Failed to read BBQ cache, re-quantizing: %s", path.c_str());
     return std::nullopt;
   }
-  // Cheaper to recompute than to store and validate.
+  // Cheaper to recompute than to store and validate. dequant_delta/dequant_sum_delta are likewise
+  // a deterministic function of the cached lower/upper_intervals, quantized_component_sums, and
+  // bits, so they are recomputed here rather than added to the on-disk layout.
   for (int64_t d = 0; d < dim; ++d) {
     q.centroid_norm_sq += q.centroid(d) * q.centroid(d);
+  }
+  const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
+  for (int64_t i = 0; i < n_rows; ++i) {
+    const float delta      = (q.upper_intervals(i) - q.lower_intervals(i)) * dequant_scale;
+    q.dequant_delta(i)     = delta;
+    q.dequant_sum_delta(i) = delta * static_cast<float>(q.quantized_component_sums(i));
   }
   RAFT_LOG_INFO("Loaded BBQ codes from %s", path.c_str());
   return q;

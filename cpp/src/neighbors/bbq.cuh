@@ -181,104 +181,11 @@ code_inner_product(const uint8_t* row_a,
 }
 
 // --------------------------------------------------------------------------
-// Metrics: symmetric (self-join)
-// One quantizer view supplies both rows.
-// --------------------------------------------------------------------------
-
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-  float code_ip,
-  int64_t row_a,
-  int64_t row_b)
-{
-  const float lower_a = dataset.lower_intervals(row_a);
-  const float lower_b = dataset.lower_intervals(row_b);
-  const float scale   = 1.0f / static_cast<float>((uint32_t{1} << dataset.bits) - 1);
-  const float delta_a = (dataset.upper_intervals(row_a) - lower_a) * scale;
-  const float delta_b = (dataset.upper_intervals(row_b) - lower_b) * scale;
-  const float sum_a   = static_cast<float>(dataset.quantized_component_sums(row_a));
-  const float sum_b   = static_cast<float>(dataset.quantized_component_sums(row_b));
-
-  return static_cast<float>(dataset.dim()) * lower_a * lower_b + lower_b * delta_a * sum_a +
-         lower_a * delta_b * sum_b + delta_a * delta_b * code_ip;
-}
-
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
-{
-  const uint8_t* codes_a = dataset.codes.data_handle() + row_a * get_encoded_row_length(dataset);
-  const uint8_t* codes_b = dataset.codes.data_handle() + row_b * get_encoded_row_length(dataset);
-  return centered_dot(
-    dataset, static_cast<float>(code_inner_product(codes_a, codes_b, dataset)), row_a, row_b);
-}
-
-// Dot product overload when the centered dot product is already computed
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-  float centered_dot_value,
-  int64_t row_a,
-  int64_t row_b)
-{
-  return centered_dot_value + dataset.additional_corrections(row_a) +
-         dataset.additional_corrections(row_b) - dataset.centroid_norm_sq;
-}
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
-{
-  return dot_product(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
-}
-
-/** Squared L2 distance overload when the centered dot product is already computed */
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-  float centered_dot_value,
-  int64_t row_a,
-  int64_t row_b)
-{
-  const float distance = dataset.additional_corrections(row_a) +
-                         dataset.additional_corrections(row_b) - 2.0f * centered_dot_value;
-  return distance < 0.0f ? 0.0f : distance;
-}
-
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-  float centered_dot_value,
-  int64_t row_a,
-  int64_t row_b,
-  float norm_product)
-{
-  const auto dot = dot_product(dataset, centered_dot_value, row_a, row_b);
-  return norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
-}
-
-/** Squared norm of one original-space row. */
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-                                          int64_t row)
-{
-  const float norm = dot_product(dataset, row, row);
-  return norm < 0.0f ? 0.0f : norm;
-}
-
-template <typename DataT, typename IdxT, typename Accessor>
-struct bbq_row_norm_op {
-  const bbq_quantizer_view<DataT, IdxT, Accessor> quantizer;
-
-  __device__ auto operator()(size_t row) const -> float
-  {
-    return row_norm(quantizer, static_cast<int64_t>(row));
-  }
-};
-
-// --------------------------------------------------------------------------
-// Metrics: asymmetric (document x query)
-// Two quantizer views; the row lives in the document view, the column in the query view.
+// Metrics: (document x query)
+// Two quantizer views; the row lives in the document view, the column in the query view. A
+// self-join (symmetric case) is just this with dataset_document == dataset_query -- passing the
+// same view twice reproduces the old single-dataset formulas bit-for-bit, so there is no separate
+// symmetric code path.
 // --------------------------------------------------------------------------
 
 template <typename DataT, typename IdxT, typename Accessor>
@@ -289,19 +196,15 @@ __device__ __forceinline__ float centered_dot(
   int64_t row_document,
   int64_t row_query)
 {
-  const float lower_doc = dataset_document.lower_intervals(row_document);
-  const float lower_q   = dataset_query.lower_intervals(row_query);
-  const float scale_document =
-    1.0f / static_cast<float>((uint32_t{1} << dataset_document.bits) - 1);
-  const float scale_query = 1.0f / static_cast<float>((uint32_t{1} << dataset_query.bits) - 1);
-  const float delta_doc =
-    (dataset_document.upper_intervals(row_document) - lower_doc) * scale_document;
-  const float delta_q = (dataset_query.upper_intervals(row_query) - lower_q) * scale_query;
-  const float sum_doc = static_cast<float>(dataset_document.quantized_component_sums(row_document));
-  const float sum_q   = static_cast<float>(dataset_query.quantized_component_sums(row_query));
+  const float lower_doc     = dataset_document.lower_intervals(row_document);
+  const float lower_q       = dataset_query.lower_intervals(row_query);
+  const float delta_doc     = dataset_document.dequant_delta(row_document);
+  const float delta_q       = dataset_query.dequant_delta(row_query);
+  const float sum_delta_doc = dataset_document.dequant_sum_delta(row_document);
+  const float sum_delta_q   = dataset_query.dequant_sum_delta(row_query);
 
   auto dim = static_cast<float>(dataset_document.dim());
-  return dim * lower_doc * lower_q + lower_q * delta_doc * sum_doc + lower_doc * delta_q * sum_q +
+  return dim * lower_doc * lower_q + lower_q * sum_delta_doc + lower_doc * sum_delta_q +
          delta_doc * delta_q * code_ip;
 }
 
@@ -346,6 +249,28 @@ __device__ __forceinline__ float cosine_distance(
     dot_product(dataset_doc, dataset_query, centered_dot_value, row_document, row_query);
   return norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
 }
+
+/** Squared norm of one original-space row -- a self-join (row against itself, same dataset). */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+                                          int64_t row)
+{
+  const uint8_t* codes_row = dataset.codes.data_handle() + row * get_encoded_row_length(dataset);
+  const float code_ip      = static_cast<float>(code_inner_product(codes_row, codes_row, dataset));
+  const float centered     = centered_dot(dataset, dataset, code_ip, row, row);
+  const float norm         = dot_product(dataset, dataset, centered, row, row);
+  return norm < 0.0f ? 0.0f : norm;
+}
+
+template <typename DataT, typename IdxT, typename Accessor>
+struct bbq_row_norm_op {
+  const bbq_quantizer_view<DataT, IdxT, Accessor> quantizer;
+
+  __device__ auto operator()(size_t row) const -> float
+  {
+    return row_norm(quantizer, static_cast<int64_t>(row));
+  }
+};
 
 // --------------------------------------------------------------------------
 // Fused inner products (2x1)
