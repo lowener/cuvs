@@ -85,9 +85,12 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
   void testNNDescent()
   {
     if (ps.second_dataset_bits.has_value()) {
+      // A packed_4b query takes the int4 wmma path, which pairs only with a packed_1b or
+      // packed_2b document. second_layout below yields packed_1b for second_bits == 1, so 1 + 4
+      // runs; second_bits == 2 would yield transposed_2b, which that path does not accept.
       if (ps.bits > 4 ||
-          (ps.bits == 4 &&
-           ps.layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_4b) ||
+          (ps.layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_4b &&
+           ps.second_dataset_bits.value() != 1) ||
           ps.bits == ps.second_dataset_bits.value() || ps.bits == 1) {
         GTEST_SKIP() << "Second dataset is N/A: bits=" << static_cast<int>(ps.bits)
                      << ", layout=" << static_cast<int>(ps.layout)
@@ -216,6 +219,10 @@ const std::vector<AnnNNDescentBbqInputs> bbq_inputs = [] {
                         {2, 0.50, bbq_code_layout::transposed_2b, std::optional<uint8_t>{}},
                         {2, 0.27, bbq_code_layout::transposed_2b, std::optional<uint8_t>{1}},
                         {4, 0.80, bbq_code_layout::packed_4b, std::optional<uint8_t>{}},
+                        // Asymmetric packed_4b query (1 + 4): the int4 wmma path with
+                        // SelfJoin = false. At dim=256 this is also the only coverage of the
+                        // phase-2 staging skip (n_tiles == 1) outside a self-join.
+                        {4, 0.35, bbq_code_layout::packed_4b, std::optional<uint8_t>{1}},
                         // Asymmetric transposed_4b queries (1 + 4t, 2t + 4t) are supported.
                         {4, 0.35, bbq_code_layout::transposed_4b, std::optional<uint8_t>{1}},
                         {4, 0.65, bbq_code_layout::transposed_4b, std::optional<uint8_t>{2}},
