@@ -418,14 +418,14 @@ void parse_build_param(const nlohmann::json& conf,
   if (conf.contains("num_dataset_splits")) {
     param.num_dataset_splits = conf.at("num_dataset_splits");
   }
-  if (conf.contains("nn_descent_bbq_query_bits") != conf.contains("nn_descent_bbq_doc_bits")) {
+  if (conf.contains("nn_descent_bbq_query_format") != conf.contains("nn_descent_bbq_doc_format")) {
     throw std::runtime_error(
-      "nn_descent_bbq_query_bits and nn_descent_bbq_doc_bits must be given together");
+      "nn_descent_bbq_query_format and nn_descent_bbq_doc_format must be given together");
   }
-  if (conf.contains("nn_descent_bbq_query_bits")) {
+  if (conf.contains("nn_descent_bbq_query_format")) {
     using bbq_param = typename cuvs::bench::cuvs_cagra<T, IdxT>::build_param::bbq_param;
     param.bbq =
-      bbq_param{conf.at("nn_descent_bbq_query_bits"), conf.at("nn_descent_bbq_doc_bits")};
+      bbq_param{conf.at("nn_descent_bbq_query_format"), conf.at("nn_descent_bbq_doc_format")};
   }
   if (conf.contains("merge_type")) {
     std::string mt = conf.at("merge_type");

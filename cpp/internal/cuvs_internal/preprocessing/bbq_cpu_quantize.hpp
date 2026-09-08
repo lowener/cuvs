@@ -25,6 +25,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -417,35 +418,68 @@ auto make_device_bbq_dataset(raft::resources const& res,
   return device;
 }
 
-/** The one packing each supported code width is stored in. */
-inline auto layout_for_bits(uint32_t bits) -> bbq_code_layout
+struct bbq_layout_token {
+  std::string_view token;
+  uint32_t bits;
+  bbq_code_layout layout;
+};
+
+// Same convention as my_tests/bbq's CLI tokens: bare N = densely packed (tensor-core-eligible),
+// N + "t" = transposed/bitplane (SIMT). At 1 bit the two coincide, so there is no "1t".
+constexpr bbq_layout_token kBbqLayoutTokens[] = {
+  {"1", 1, bbq_code_layout::packed_1b},
+  {"2", 2, bbq_code_layout::packed_2b},
+  {"4", 4, bbq_code_layout::packed_4b},
+  {"2t", 2, bbq_code_layout::transposed_2b},
+  {"4t", 4, bbq_code_layout::transposed_4b},
+  {"7", 7, bbq_code_layout::packed_7b},
+  {"8", 8, bbq_code_layout::packed_8b},
+};
+
+/** Parses a layout token into its (bits, layout) pair -- the layout is no longer derivable from
+ *  bits alone, since e.g. bits=4 is ambiguous between packed_4b and transposed_4b. */
+inline auto parse_bbq_layout_token(std::string_view token) -> std::pair<uint32_t, bbq_code_layout>
 {
-  switch (bits) {
-    case 1: return bbq_code_layout::packed_1b;
-    case 2: return bbq_code_layout::transposed_2b;
-    case 4: return bbq_code_layout::transposed_4b;
-    case 7: return bbq_code_layout::packed_7b;
-    case 8: return bbq_code_layout::packed_8b;
-    default: RAFT_FAIL("BBQ bits must be one of 1, 2, 4, 7 or 8; got %u.", bits);
+  for (const auto& t : kBbqLayoutTokens) {
+    if (t.token == token) { return {t.bits, t.layout}; }
   }
+  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2, 4, 2t, 4t, 7, 8.",
+            std::string(token).c_str());
 }
 
 /**
- * Reject pairs the kernels cannot serve. Without this the library silently falls back to a
- * symmetric join on the first quantizer, which looks like a working asymmetric run.
+ * Reject layout pairs the local-join kernels cannot serve. Without this the library either
+ * silently falls back to a symmetric join on the first quantizer (which looks like a working
+ * asymmetric run), or reaches an unsupported-layout failure deep inside GNND::build. Must be kept
+ * in sync with the dispatch in GNND<Data_t, Index_t>::local_join (nn_descent.cuh).
  */
-inline void validate_bits(uint32_t query_bits, uint32_t doc_bits)
+inline void validate_layout_pair(bbq_code_layout query_layout, bbq_code_layout doc_layout)
 {
-  (void)layout_for_bits(query_bits);
-  (void)layout_for_bits(doc_bits);
-  if (query_bits == doc_bits) { return; }
-  const bool supported = (query_bits == 2 && doc_bits == 1) || (query_bits == 4 && doc_bits == 1) ||
-                         (query_bits == 4 && doc_bits == 2);
+  if (query_layout == doc_layout) {
+    const bool supported = query_layout == bbq_code_layout::packed_1b ||
+                           query_layout == bbq_code_layout::transposed_2b ||
+                           query_layout == bbq_code_layout::packed_4b ||
+                           query_layout == bbq_code_layout::packed_7b ||
+                           query_layout == bbq_code_layout::packed_8b;
+    RAFT_EXPECTS(supported,
+                 "Symmetric BBQ NN-Descent has no local-join kernel for layout %d -- packed_2b "
+                 "and transposed_4b are only supported as one side of an asymmetric pair.",
+                 static_cast<int>(query_layout));
+    return;
+  }
+  const bool supported =
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::packed_4b) ||
+    (doc_layout == bbq_code_layout::packed_2b && query_layout == bbq_code_layout::packed_4b) ||
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_2b) ||
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_4b) ||
+    (doc_layout == bbq_code_layout::transposed_2b &&
+     query_layout == bbq_code_layout::transposed_4b);
   RAFT_EXPECTS(supported,
-               "Asymmetric BBQ NN-Descent supports only (query_bits, doc_bits) of (2, 1), (4, 1) "
-               "or (4, 2); got (%u, %u).",
-               query_bits,
-               doc_bits);
+               "Asymmetric BBQ NN-Descent supports only (doc, query) layouts of (packed_1b, "
+               "packed_4b), (packed_2b, packed_4b), (packed_1b, transposed_2b), (packed_1b, "
+               "transposed_4b), or (transposed_2b, transposed_4b); got (%d, %d).",
+               static_cast<int>(doc_layout),
+               static_cast<int>(query_layout));
 }
 
 /** Every parameter that affects the codes is in the name, so the cache self-invalidates. */
@@ -572,10 +606,10 @@ inline auto quantize_cached(const float* rows,
                             int64_t n_rows,
                             int64_t dim,
                             uint32_t bits,
+                            bbq_code_layout layout,
                             cuvs::distance::DistanceType metric) -> host_storage
 {
-  const auto layout = layout_for_bits(bits);
-  const auto path   = cache_path(n_rows, dim, bits, layout, metric);
+  const auto path = cache_path(n_rows, dim, bits, layout, metric);
   if (auto cached = cache_load(path, n_rows, dim, bits, layout, metric)) {
     return std::move(*cached);
   }
@@ -587,7 +621,7 @@ inline auto quantize_cached(const float* rows,
 /**
  * Quantize host-resident @p rows and upload the codes, ready for the BBQ NN-Descent build.
  *
- * `query_bits == doc_bits` produces a single quantizer and a symmetric join; differing widths
+ * `query_token == doc_token` produces a single quantizer and a symmetric join; differing tokens
  * produce two quantizers and an asymmetric join, where the wider codes serve the query side.
  */
 inline auto quantize_to_device(raft::resources const& res,
@@ -595,14 +629,17 @@ inline auto quantize_to_device(raft::resources const& res,
                                int64_t n_rows,
                                int64_t dim,
                                cuvs::distance::DistanceType metric,
-                               uint32_t query_bits,
-                               uint32_t doc_bits) -> cuvs::neighbors::device_bbq_dataset<int64_t>
+                               std::string_view query_token,
+                               std::string_view doc_token)
+  -> cuvs::neighbors::device_bbq_dataset<int64_t>
 {
-  validate_bits(query_bits, doc_bits);
+  const auto [query_bits, query_layout] = parse_bbq_layout_token(query_token);
+  const auto [doc_bits, doc_layout]     = parse_bbq_layout_token(doc_token);
+  validate_layout_pair(query_layout, doc_layout);
   cuvs::neighbors::host_bbq_dataset<int64_t> host{
-    quantize_cached(rows, n_rows, dim, query_bits, metric)};
-  if (doc_bits != query_bits) {
-    host.add_quantizer(quantize_cached(rows, n_rows, dim, doc_bits, metric));
+    quantize_cached(rows, n_rows, dim, query_bits, query_layout, metric)};
+  if (doc_token != query_token) {
+    host.add_quantizer(quantize_cached(rows, n_rows, dim, doc_bits, doc_layout, metric));
   }
   auto device = make_device_bbq_dataset<int64_t>(res, host);
   // The uploads are stream-ordered against `host`, which dies with this frame.
