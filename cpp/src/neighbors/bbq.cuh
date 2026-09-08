@@ -236,20 +236,6 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float cosine_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
-  float centered_dot_value,
-  int64_t row_document,
-  int64_t row_query,
-  float norm_product)
-{
-  const auto dot =
-    dot_product(dataset_doc, dataset_query, centered_dot_value, row_document, row_query);
-  return norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
-}
-
 /** Squared norm of one original-space row -- a self-join (row against itself, same dataset). */
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,

@@ -951,14 +951,12 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
   idx[0] = lane_id;
   idx[1] = raft::warp_size() + lane_id;
 
-  auto compute_dist = [&](int k) -> float {
-    if (idx[k] >= neighbs_size || neighbs[idx[k]] == id) {
-      return std::numeric_limits<DistData_t>::max();
-    }
-    const uint32_t raw         = find_in_row ? s_distances_u32[idx_in_list * stride + idx[k]]
-                                             : s_distances_u32[idx_in_list + idx[k] * stride];
-    const Index_t row_document = find_in_row ? id : neighbs[idx[k]];
-    const Index_t row_query    = find_in_row ? neighbs[idx[k]] : id;
+  auto compute_dist = [&](int i) -> float {
+    if (i >= neighbs_size || neighbs[i] == id) { return std::numeric_limits<DistData_t>::max(); }
+    const uint32_t raw         = find_in_row ? s_distances_u32[idx_in_list * stride + i]
+                                             : s_distances_u32[idx_in_list + i * stride];
+    const Index_t row_document = find_in_row ? id : neighbs[i];
+    const Index_t row_query    = find_in_row ? neighbs[i] : id;
     const float centered       = cuvs::preprocessing::quantize::bbq::centered_dot(
       quantizer_document, quantizer_query, static_cast<float>(raw), row_document, row_query);
     float d;
@@ -974,15 +972,16 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
         quantizer_document, quantizer_query, centered, row_document, row_query);
     } else {  // CosineExpanded
       const float norm_product = l2_norms_document[row_document] * l2_norms_query[row_query];
-      d                        = cuvs::preprocessing::quantize::bbq::cosine_distance(
-        quantizer_document, quantizer_query, centered, row_document, row_query, norm_product);
+      const float dot          = cuvs::preprocessing::quantize::bbq::dot_product(
+        quantizer_document, quantizer_query, centered, row_document, row_query);
+      d = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
     }
     return dist_epilogue(d, row_document, row_query);
   };
 
   float dist[MAX_NUM_BI_SAMPLES / raft::warp_size()];
-  dist[0] = compute_dist(0);
-  dist[1] = compute_dist(1);
+  dist[0] = compute_dist(idx[0]);
+  dist[1] = compute_dist(idx[1]);
 
   if (dist[1] < dist[0]) {
     dist[0] = dist[1];
@@ -1639,45 +1638,46 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     __syncthreads();
   }
 
-  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
+  // Split from one combined [0, 2*MAX_NUM_BI_SAMPLES) loop into two: MAX_NUM_BI_SAMPLES is evenly
+  // divisible by num_warps (64/16), so this costs no extra steps, and it turns the old
+  // branch-per-half + double bounds-guard into one guard per loop, each new_size/old_size sized.
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
-    if (idx_in_list >= new_size && idx_in_list < MAX_NUM_BI_SAMPLES) continue;
-    if (idx_in_list >= MAX_NUM_BI_SAMPLES + old_size && idx_in_list < MAX_NUM_BI_SAMPLES * 2) {
-      continue;
-    }
-
-    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
-                                 std::numeric_limits<DistData_t>::max()};
-    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
-      auto temp_min_item = get_min_item_fused(s_list[idx_in_list],
-                                              idx_in_list,
-                                              old_neighbors,
-                                              old_size,
-                                              s_distances_u32,
-                                              dataset_document,
-                                              dataset_query,
-                                              l2_norms_document,
-                                              l2_norms_query,
-                                              metric,
-                                              dist_epilogue);
-      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
-    } else {
-      auto temp_min_item = get_min_item_fused(s_list[idx_in_list],
-                                              idx_in_list - MAX_NUM_BI_SAMPLES,
-                                              new_neighbors,
-                                              new_size,
-                                              s_distances_u32,
-                                              dataset_document,
-                                              dataset_query,
-                                              l2_norms_document,
-                                              l2_norms_query,
-                                              metric,
-                                              dist_epilogue,
-                                              false);
-      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
-    }
+    if (idx_in_list >= new_size) continue;
+    auto min_elem = get_min_item_fused(s_list[idx_in_list],
+                                       idx_in_list,
+                                       old_neighbors,
+                                       old_size,
+                                       s_distances_u32,
+                                       dataset_document,
+                                       dataset_query,
+                                       l2_norms_document,
+                                       l2_norms_query,
+                                       metric,
+                                       dist_epilogue);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
+
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= old_size) continue;
+    const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
+    auto min_elem      = get_min_item_fused(s_list[list_idx],
+                                       idx_in_list,
+                                       new_neighbors,
+                                       new_size,
+                                       s_distances_u32,
+                                       dataset_document,
+                                       dataset_query,
+                                       l2_norms_document,
+                                       l2_norms_query,
+                                       metric,
+                                       dist_epilogue,
+                                       false);
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
   }
 }
@@ -2111,22 +2111,25 @@ __launch_bounds__(BLOCK_SIZE)
   // ---- Phase 2: new x old ----
   run_phase(old_neighbors, old_size, std::false_type{}, n_tiles == 1);
 
-  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
+  // Split from one combined [0, 2*MAX_NUM_BI_SAMPLES) loop into two: MAX_NUM_BI_SAMPLES is evenly
+  // divisible by num_warps (64/16), so this costs no extra steps, and it turns the old
+  // branch-per-half + double bounds-guard into one guard per loop, each new_size/old_size sized.
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
-    if (idx_in_list >= new_size && idx_in_list < MAX_NUM_BI_SAMPLES) continue;
-    if (idx_in_list >= MAX_NUM_BI_SAMPLES + old_size && idx_in_list < MAX_NUM_BI_SAMPLES * 2) {
-      continue;
-    }
-
-    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
-                                 std::numeric_limits<DistData_t>::max()};
-    auto temp_min_item =
-      idx_in_list < MAX_NUM_BI_SAMPLES
-        ? min_over(idx_in_list, idx_in_list, old_neighbors, old_size, true)
-        : min_over(idx_in_list, idx_in_list - MAX_NUM_BI_SAMPLES, new_neighbors, new_size, false);
-    if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
+    if (idx_in_list >= new_size) continue;
+    auto min_elem = min_over(idx_in_list, idx_in_list, old_neighbors, old_size, true);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
+
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= old_size) continue;
+    const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
+    auto min_elem      = min_over(list_idx, idx_in_list, new_neighbors, new_size, false);
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
   }
 #endif  // 750 <= __CUDA_ARCH__ <= 900
