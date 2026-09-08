@@ -914,12 +914,11 @@ __launch_bounds__(BLOCK_SIZE)
 // whose store bank conflicts dominate), moderate for the symmetric SIMT kernel (~5-7%, which
 // also sheds 8 registers), and roughly break-even for the asymmetric SIMT kernel.
 //
-// One function covers both symmetric and asymmetric: the two-quantizer centered_dot/l2_distance/
-// dot_product/cosine_distance overloads used below are exact generalizations of their
-// single-quantizer counterparts -- passing quantizer_document == quantizer_query (and
-// l2_norms_document == l2_norms_query) reproduces the symmetric computation bit-for-bit, verified
-// directly against bbq.cuh's definitions. The plain (non-fused) get_min_item is untouched and
-// still used by local_join_kernel_simt, the scalar local_join_kernel_bbq_simt, and
+// One function covers both symmetric and asymmetric: the two-quantizer centered_dot() overload
+// used below is an exact generalization of its single-quantizer counterpart -- passing
+// quantizer_document == quantizer_query reproduces the symmetric computation bit-for-bit, verified
+// directly against bbq.cuh's definition. The plain (non-fused) get_min_item is untouched and still
+// used by local_join_kernel_simt, the scalar local_join_kernel_bbq_simt, and
 // local_join_kernel_wmma.
 //
 // Row/col semantics mirror get_min_item: `id`/`idx_in_list` name one fixed axis, `neighbs` the
@@ -936,8 +935,6 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
   const uint32_t* s_distances_u32,
   const bbq_device_quantizer_view<DataT, int64_t> quantizer_document,
   const bbq_device_quantizer_view<DataT, int64_t> quantizer_query,
-  DistData_t* l2_norms_document,
-  DistData_t* l2_norms_query,
   cuvs::distance::DistanceType metric,
   DistEpilogue_t dist_epilogue,
   const bool find_in_row = true,
@@ -947,9 +944,8 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
   const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
 
   static_assert(MAX_NUM_BI_SAMPLES == 64);
-  int idx[MAX_NUM_BI_SAMPLES / raft::warp_size()];
-  idx[0] = lane_id;
-  idx[1] = raft::warp_size() + lane_id;
+  int idx0 = lane_id;
+  int idx1 = raft::warp_size() + lane_id;
 
   auto compute_dist = [&](int i) -> float {
     if (i >= neighbs_size || neighbs[i] == id) { return std::numeric_limits<DistData_t>::max(); }
@@ -959,47 +955,49 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
     const Index_t row_query    = find_in_row ? neighbs[i] : id;
     const float centered       = cuvs::preprocessing::quantize::bbq::centered_dot(
       quantizer_document, quantizer_query, static_cast<float>(raw), row_document, row_query);
+    // Every metric below needs additional_corrections(doc) + additional_corrections(query): L2
+    // directly, InnerProduct/Cosine via the reconstructed original-space dot product.
+    const float corrections = quantizer_document.additional_corrections(row_document) +
+                              quantizer_query.additional_corrections(row_query);
     float d;
     if (metric == cuvs::distance::DistanceType::L2Expanded ||
         metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-      d = cuvs::preprocessing::quantize::bbq::l2_distance(
-        quantizer_document, quantizer_query, centered, row_document, row_query);
+      const float raw_distance = corrections - 2.0f * centered;
+      d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
       if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
         d = sqrtf(d);
       }
     } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-      d = -cuvs::preprocessing::quantize::bbq::dot_product(
-        quantizer_document, quantizer_query, centered, row_document, row_query);
+      d = -(centered + corrections - quantizer_document.centroid_norm_sq);
     } else {  // CosineExpanded
-      const float norm_product = l2_norms_document[row_document] * l2_norms_query[row_query];
-      const float dot          = cuvs::preprocessing::quantize::bbq::dot_product(
-        quantizer_document, quantizer_query, centered, row_document, row_query);
-      d = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+      const float norm_product =
+        quantizer_document.row_norm(row_document) * quantizer_query.row_norm(row_query);
+      const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
+      d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
     }
     return dist_epilogue(d, row_document, row_query);
   };
 
-  float dist[MAX_NUM_BI_SAMPLES / raft::warp_size()];
-  dist[0] = compute_dist(idx[0]);
-  dist[1] = compute_dist(idx[1]);
+  float dist0 = compute_dist(idx0);
+  float dist1 = compute_dist(idx1);
 
-  if (dist[1] < dist[0]) {
-    dist[0] = dist[1];
-    idx[0]  = idx[1];
+  if (dist1 < dist0) {
+    dist0 = dist1;
+    idx0  = idx1;
   }
   __syncwarp();
   for (int offset = raft::warp_size() >> 1; offset >= 1; offset >>= 1) {
-    float other_idx  = __shfl_down_sync(raft::warp_full_mask(), idx[0], offset);
-    float other_dist = __shfl_down_sync(raft::warp_full_mask(), dist[0], offset);
-    if (other_dist < dist[0]) {
-      dist[0] = other_dist;
-      idx[0]  = other_idx;
+    float other_idx  = __shfl_down_sync(raft::warp_full_mask(), idx0, offset);
+    float other_dist = __shfl_down_sync(raft::warp_full_mask(), dist0, offset);
+    if (other_dist < dist0) {
+      dist0 = other_dist;
+      idx0  = other_idx;
     }
   }
 
   ResultItem<Index_t> result;
-  result.dist()         = __shfl_sync(raft::warp_full_mask(), dist[0], 0);
-  result.id_with_flag() = neighbs[__shfl_sync(raft::warp_full_mask(), idx[0], 0)];
+  result.dist()         = __shfl_sync(raft::warp_full_mask(), dist0, 0);
+  result.id_with_flag() = neighbs[__shfl_sync(raft::warp_full_mask(), idx0, 0)];
   return result;
 }
 
@@ -1363,8 +1361,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                              DistData_t* dists,
                              int graph_width,
                              int* locks,
-                             DistData_t* l2_norms_document,
-                             DistData_t* l2_norms_query,
                              cuvs::distance::DistanceType metric,
                              DistEpilogue_t dist_epilogue)
 {
@@ -1563,8 +1559,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                        s_distances_u32,
                                        dataset_document,
                                        dataset_query,
-                                       l2_norms_document,
-                                       l2_norms_query,
                                        metric,
                                        dist_epilogue);
     if (min_elem.id() < gridDim.x) {
@@ -1651,8 +1645,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                        s_distances_u32,
                                        dataset_document,
                                        dataset_query,
-                                       l2_norms_document,
-                                       l2_norms_query,
                                        metric,
                                        dist_epilogue);
     if (min_elem.id() < gridDim.x) {
@@ -1671,8 +1663,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                        s_distances_u32,
                                        dataset_document,
                                        dataset_query,
-                                       l2_norms_document,
-                                       l2_norms_query,
                                        metric,
                                        dist_epilogue,
                                        false);
@@ -1864,8 +1854,6 @@ __launch_bounds__(BLOCK_SIZE)
                              DistData_t* dists,
                              int graph_width,
                              int* locks,
-                             DistData_t* l2_norms_document,
-                             DistData_t* l2_norms_query,
                              cuvs::distance::DistanceType metric,
                              DistEpilogue_t dist_epilogue)
 {
@@ -2085,8 +2073,6 @@ __launch_bounds__(BLOCK_SIZE)
                                 s_distances_u32,
                                 dataset_document,
                                 dataset_query,
-                                l2_norms_document,
-                                l2_norms_query,
                                 metric,
                                 dist_epilogue,
                                 find_in_row,
@@ -2578,20 +2564,6 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
                  static_cast<long long>(quantizer_document.dim()));
   }
 
-  auto l2_norms_query_owned         = std::optional<raft::device_vector<DistData_t, size_t>>();
-  DistData_t* l2_norms_document_ptr = l2_norms_.data_handle();
-  DistData_t* l2_norms_query_ptr    = l2_norms_.data_handle();
-  if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
-    raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer_document});
-    if (!self_join) {
-      l2_norms_query_owned =
-        std::make_optional(raft::make_device_vector<DistData_t, size_t>(res, nrow_));
-      l2_norms_query_ptr = l2_norms_query_owned.value().data_handle();
-      raft::linalg::map_offset(
-        res, l2_norms_query_owned.value().view(), bbq::bbq_row_norm_op{quantizer_query});
-    }
-  }
-
   // One launch site for both kernels: they take identical arguments, and the query's layout picks
   // the path -- packed_4b is the only layout the int4 tensor-core kernel is dispatched for.
   auto launch = [&](auto document_layout, auto query_layout, auto self_join_tag) {
@@ -2603,8 +2575,7 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     d_list_sizes_new_.data_handle(), h_graph_old_.data_handle(), h_rev_graph_old_.data_handle(), \
     d_list_sizes_old_.data_handle(), NUM_SAMPLES, quantizer_document, quantizer_query,           \
     graph_buffer_.data_handle(), dists_buffer_.data_handle(), DEGREE_ON_DEVICE,                  \
-    d_locks_.data_handle(), l2_norms_document_ptr, l2_norms_query_ptr, build_config_.metric,     \
-    dist_epilogue
+    d_locks_.data_handle(), build_config_.metric, dist_epilogue
     if constexpr (Q == L::packed_4b) {
       local_join_kernel_bbq_wmma<D, Q, S>
         <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);

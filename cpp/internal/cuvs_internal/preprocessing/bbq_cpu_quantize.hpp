@@ -279,11 +279,20 @@ inline host_storage quantize(const float* data,
   auto dequant_delta        = raft::make_host_vector<float, int64_t>(n_rows);
   auto dequant_sum_delta    = raft::make_host_vector<float, int64_t>(n_rows);
   const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
+  // Squared norm of the row in original (pre-centering) space -- needed by CosineExpanded, not
+  // derivable from `additional_corrections` (that's the centered/residual norm for the euclidean
+  // metric, or a centroid dot product otherwise), so computed here directly from `data`.
+  auto row_norm = raft::make_host_vector<float, int64_t>(n_rows);
 
 #pragma omp parallel for
   for (int64_t i = 0; i < n_rows; ++i) {
     std::vector<float> row(data + i * dim, data + (i + 1) * dim);
     std::vector<uint8_t> codes(dim);
+    float orig_norm2 = 0.0f;
+    for (int64_t d = 0; d < dim; ++d) {
+      orig_norm2 += row[d] * row[d];
+    }
+    row_norm(i)       = orig_norm2;
     const auto result = scalar_quantize(row, codes, bits, centroid.data_handle(), euclidean);
     std::copy(codes.begin(), codes.end(), unpacked.begin() + i * dim);
     lower_intervals(i)          = result.lower_interval;
@@ -309,6 +318,7 @@ inline host_storage quantize(const float* data,
                       std::move(centroid),
                       std::move(dequant_delta),
                       std::move(dequant_sum_delta),
+                      std::move(row_norm),
                       static_cast<uint32_t>(bits),
                       layout,
                       metric,
@@ -348,6 +358,7 @@ auto copy_bbq_owning_storage_host_to_device(
     raft::make_device_vector<float, IdxT>(res, host_storage.dequant_delta.extent(0));
   auto dequant_sum_delta =
     raft::make_device_vector<float, IdxT>(res, host_storage.dequant_sum_delta.extent(0));
+  auto row_norm = raft::make_device_vector<float, IdxT>(res, host_storage.row_norm.extent(0));
 
   raft::copy(codes.data_handle(), host_storage.codes.data_handle(), codes.size(), stream);
   raft::copy(lower_intervals.data_handle(),
@@ -375,6 +386,7 @@ auto copy_bbq_owning_storage_host_to_device(
              host_storage.dequant_sum_delta.data_handle(),
              dequant_sum_delta.size(),
              stream);
+  raft::copy(row_norm.data_handle(), host_storage.row_norm.data_handle(), row_norm.size(), stream);
 
   return {std::move(codes),
           std::move(lower_intervals),
@@ -384,6 +396,7 @@ auto copy_bbq_owning_storage_host_to_device(
           std::move(centroid),
           std::move(dequant_delta),
           std::move(dequant_sum_delta),
+          std::move(row_norm),
           host_storage.bits,
           host_storage.layout,
           host_storage.metric,
@@ -459,6 +472,9 @@ void for_each_buffer(host_storage& q, OpT op)
   op(q.additional_corrections.data_handle(), q.additional_corrections.size() * sizeof(float));
   op(q.quantized_component_sums.data_handle(), q.quantized_component_sums.size() * sizeof(int32_t));
   op(q.centroid.data_handle(), q.centroid.size() * sizeof(float));
+  // Unlike dequant_delta/dequant_sum_delta, row_norm (original-space ||x||^2) isn't derivable
+  // from the other cached fields, so it has to round-trip through the cache.
+  op(q.row_norm.data_handle(), q.row_norm.size() * sizeof(float));
 }
 
 /** Allocates the arrays of the given shape, leaving their contents undefined. */
@@ -475,6 +491,7 @@ inline auto make_host_storage(int64_t n_rows,
                       raft::make_host_vector<float, int64_t>(n_rows),
                       raft::make_host_vector<int32_t, int64_t>(n_rows),
                       raft::make_host_vector<float, int64_t>(dim),
+                      raft::make_host_vector<float, int64_t>(n_rows),
                       raft::make_host_vector<float, int64_t>(n_rows),
                       raft::make_host_vector<float, int64_t>(n_rows),
                       bits,

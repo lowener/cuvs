@@ -170,16 +170,6 @@ __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
   }
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ uint32_t
-code_inner_product(const uint8_t* row_a,
-                   const uint8_t* row_b,
-                   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
-{
-  return code_inner_product(
-    row_a, row_b, dataset.layout, dataset.bits, get_encoded_row_length(dataset));
-}
-
 // --------------------------------------------------------------------------
 // Metrics: (document x query)
 // Two quantizer views; the row lives in the document view, the column in the query view. A
@@ -207,56 +197,6 @@ __device__ __forceinline__ float centered_dot(
   return dim * lower_doc * lower_q + lower_q * sum_delta_doc + lower_doc * sum_delta_q +
          delta_doc * delta_q * code_ip;
 }
-
-// Dot product overload when the centered dot product is already computed
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float dot_product(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
-  float centered_dot_value,
-  int64_t row_document,
-  int64_t row_query)
-{
-  return centered_dot_value + dataset_document.additional_corrections(row_document) +
-         dataset_query.additional_corrections(row_query) - dataset_document.centroid_norm_sq;
-}
-
-/** Squared L2 distance overload when the centered dot product is already computed */
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float l2_distance(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
-  float centered_dot_value,
-  int64_t row_document,
-  int64_t row_query)
-{
-  const float distance = dataset_doc.additional_corrections(row_document) +
-                         dataset_query.additional_corrections(row_query) -
-                         2.0f * centered_dot_value;
-  return distance < 0.0f ? 0.0f : distance;
-}
-
-/** Squared norm of one original-space row -- a self-join (row against itself, same dataset). */
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
-                                          int64_t row)
-{
-  const uint8_t* codes_row = dataset.codes.data_handle() + row * get_encoded_row_length(dataset);
-  const float code_ip      = static_cast<float>(code_inner_product(codes_row, codes_row, dataset));
-  const float centered     = centered_dot(dataset, dataset, code_ip, row, row);
-  const float norm         = dot_product(dataset, dataset, centered, row, row);
-  return norm < 0.0f ? 0.0f : norm;
-}
-
-template <typename DataT, typename IdxT, typename Accessor>
-struct bbq_row_norm_op {
-  const bbq_quantizer_view<DataT, IdxT, Accessor> quantizer;
-
-  __device__ auto operator()(size_t row) const -> float
-  {
-    return row_norm(quantizer, static_cast<int64_t>(row));
-  }
-};
 
 // --------------------------------------------------------------------------
 // Fused inner products (2x1)

@@ -74,6 +74,11 @@ struct bbq_quantizer {
   // re-deriving them (division, subtraction, int->float cast) on every call.
   dense_owning_vector<float, IdxT, Accessor> dequant_delta;
   dense_owning_vector<float, IdxT, Accessor> dequant_sum_delta;
+  // Squared norm of the row in original (un-centered) vector space, ||x||^2 -- precomputed once
+  // (offline) since it's a function of the raw input, not derivable from the other stored
+  // per-row scalars. Used by CosineExpanded, previously recomputed on-device every NN-descent
+  // local-join call via row_norm()/bbq_row_norm_op; now just a per-row lookup.
+  dense_owning_vector<float, IdxT, Accessor> row_norm;
 
   uint32_t bits{};
   bbq_code_layout layout{bbq_code_layout::packed_1b};
@@ -88,6 +93,7 @@ struct bbq_quantizer {
                 dense_owning_vector<DataT, IdxT, Accessor>&& centroid,
                 dense_owning_vector<float, IdxT, Accessor>&& dequant_delta,
                 dense_owning_vector<float, IdxT, Accessor>&& dequant_sum_delta,
+                dense_owning_vector<float, IdxT, Accessor>&& row_norm,
                 uint32_t bits,
                 bbq_code_layout layout,
                 cuvs::distance::DistanceType metric,
@@ -100,6 +106,7 @@ struct bbq_quantizer {
       centroid{std::move(centroid)},
       dequant_delta{std::move(dequant_delta)},
       dequant_sum_delta{std::move(dequant_sum_delta)},
+      row_norm{std::move(row_norm)},
       bits{bits},
       layout{layout},
       metric{metric},
@@ -112,7 +119,8 @@ struct bbq_quantizer {
     RAFT_EXPECTS(lower_intervals.extent(0) == n_rows && upper_intervals.extent(0) == n_rows &&
                    additional_corrections.extent(0) == n_rows &&
                    quantized_component_sums.extent(0) == n_rows &&
-                   dequant_delta.extent(0) == n_rows && dequant_sum_delta.extent(0) == n_rows,
+                   dequant_delta.extent(0) == n_rows && dequant_sum_delta.extent(0) == n_rows &&
+                   row_norm.extent(0) == n_rows,
                  "Every BBQ correction array must contain one value per row.");
   }
 
@@ -154,6 +162,7 @@ struct bbq_quantizer_view {
   dense_view_vector<const DataT, IdxT, Accessor> centroid;
   dense_view_vector<const float, IdxT, Accessor> dequant_delta;
   dense_view_vector<const float, IdxT, Accessor> dequant_sum_delta;
+  dense_view_vector<const float, IdxT, Accessor> row_norm;
 
   uint32_t bits{};
   bbq_code_layout layout{bbq_code_layout::packed_1b};
@@ -169,6 +178,7 @@ struct bbq_quantizer_view {
       centroid{quantizer.centroid.view()},
       dequant_delta{quantizer.dequant_delta.view()},
       dequant_sum_delta{quantizer.dequant_sum_delta.view()},
+      row_norm{quantizer.row_norm.view()},
       bits{quantizer.bits},
       layout{quantizer.layout},
       metric{quantizer.metric},
