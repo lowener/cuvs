@@ -566,7 +566,7 @@ __device__ __forceinline__ void calculate_metric(float* s_distances,
 {
   // if we have a distance epilogue, distances need to be fully calculated instead of postprocessing
   // them.
-  bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+  constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
 
   for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
     int row_id = i / SKEWED_MAX_NUM_BI_SAMPLES;
@@ -896,38 +896,25 @@ __launch_bounds__(BLOCK_SIZE)
 #endif
 }
 
-// Fused replacement for calculate_metric_bbq_symmetric/calculate_metric_bbq_asymmetric +
-// get_min_item, used by every BBQ local-join kernel. s_distances_u32 already holds the raw dot
-// products, fully written and visible after the __syncthreads() that ends the K-loop, so no
-// separate full-grid pass is needed to convert them to float distances before searching for the
-// min: the conversion happens inline, in registers, right before the warp min-reduction. This
-// removes both the separate calculate_metric_* sweep and the __syncthreads() between it and the
-// search, and drops out-of-range entries from touching SMEM at all (the bounds check is done
-// from registers).
+// Fused replacement for calculate_metric_bbq_* + get_min_item, used by every BBQ local-join
+// kernel: s_distances_u32 already holds the raw dot products (fully written and visible after the
+// K-loop's __syncthreads()), so distances are converted to float inline, in registers, right
+// before the warp min-reduction, instead of a separate full-grid conversion pass. This is a trade,
+// not a free win -- phase 2 reads each matrix entry once per row-sweep (find_in_row=true) and once
+// per column-sweep (find_in_row=false), so it pays 2x the metric arithmetic for the removed SMEM
+// traffic/barrier. See TENSOR_CORE_NOTES.md for current per-kernel measurements.
 //
-// It is a *trade*, not a free win, and the balance differs per phase. Phase 1 sweeps rows only,
-// so each (row, col) entry is converted exactly once either way -- pure traffic/barrier savings.
-// Phase 2 sweeps rows (find_in_row=true) and columns (find_in_row=false) over the same matrix:
-// the old code converted each entry once in calculate_metric_* and then read it twice, whereas
-// this converts it once per pass, i.e. 2x the metric arithmetic in exchange for the traffic.
-// That is why the win tracks how SMEM-bound a kernel is -- large for the wmma kernels (~11%,
-// whose store bank conflicts dominate), moderate for the symmetric SIMT kernel (~5-7%, which
-// also sheds 8 registers), and roughly break-even for the asymmetric SIMT kernel.
+// One function covers both symmetric and asymmetric: passing quantizer_document == quantizer_query
+// reproduces the old single-quantizer centered-dot formula bit-for-bit. The plain (non-fused)
+// get_min_item is untouched, still used by local_join_kernel_simt, the scalar
+// local_join_kernel_bbq_simt, and local_join_kernel_wmma.
 //
-// One function covers both symmetric and asymmetric: the two-quantizer centered_dot() overload
-// used below is an exact generalization of its single-quantizer counterpart -- passing
-// quantizer_document == quantizer_query reproduces the symmetric computation bit-for-bit, verified
-// directly against bbq.cuh's definition. The plain (non-fused) get_min_item is untouched and still
-// used by local_join_kernel_simt, the scalar local_join_kernel_bbq_simt, and
-// local_join_kernel_wmma.
-//
-// Row/col semantics mirror get_min_item: `id`/`idx_in_list` name one fixed axis, `neighbs` the
-// other (varying) axis. The s_distances_u32 matrix itself is always [row=document][col=query]
-// regardless of find_in_row -- find_in_row only picks which axis is fixed vs. swept, so which of
-// (id, neighbs[idx]) is the document vs. the query flips with it too (moot when document ==
-// query, i.e. the symmetric case).
-template <typename DataT, typename Index_t, typename DistEpilogue_t>
-__device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
+// Row/col semantics: `id`/`idx_in_list` name one fixed axis, `neighbs` the varying one.
+// s_distances_u32 is always [row=document][col=query]; find_in_row (a template parameter, so the
+// two variants are specialized and compiled independently) picks which axis is fixed vs. swept, so
+// which of (id, neighbs[idx]) is the document vs. the query flips with it (moot when symmetric).
+template <bool find_in_row, typename DataT, typename Index_t, typename DistEpilogue_t>
+__device__ inline ResultItem<Index_t> get_min_item_fused(
   const Index_t id,
   const int idx_in_list,
   const Index_t* neighbs,
@@ -937,28 +924,47 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
   const bbq_device_quantizer_view<DataT, int64_t> quantizer_query,
   cuvs::distance::DistanceType metric,
   DistEpilogue_t dist_epilogue,
-  const bool find_in_row = true,
-  const int stride       = SKEWED_MAX_NUM_BI_SAMPLES)
+  const int stride = SKEWED_MAX_NUM_BI_SAMPLES)
 {
-  const int lane_id               = threadIdx.x % raft::warp_size();
-  const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+  constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
 
   static_assert(MAX_NUM_BI_SAMPLES == 64);
-  int idx0 = lane_id;
-  int idx1 = raft::warp_size() + lane_id;
+
+  // `id`'s side is the same row for both compute_dist calls below (and warp-uniform across the
+  // whole call) -- find_in_row picks whether that's the document or the query side. Its per-row
+  // terms are looked up once here instead of once per compute_dist call.
+  const auto& fixed_view        = find_in_row ? quantizer_document : quantizer_query;
+  const auto& varying_view      = find_in_row ? quantizer_query : quantizer_document;
+  const float lower_fixed       = fixed_view.lower_intervals(id);
+  const float delta_fixed       = fixed_view.dequant_delta(id);
+  const float sum_delta_fixed   = fixed_view.dequant_sum_delta(id);
+  const float corrections_fixed = fixed_view.additional_corrections(id);
+  // Only CosineExpanded needs this; metric is the same for every thread in the kernel, so this
+  // branch costs no divergence and skips the load entirely for L2/InnerProduct launches.
+  const float row_norm_fixed =
+    metric == cuvs::distance::DistanceType::CosineExpanded ? fixed_view.row_norm(id) : 0.0f;
+  const float dim = static_cast<float>(quantizer_document.dim());
 
   auto compute_dist = [&](int i) -> float {
     if (i >= neighbs_size || neighbs[i] == id) { return std::numeric_limits<DistData_t>::max(); }
     const uint32_t raw         = find_in_row ? s_distances_u32[idx_in_list * stride + i]
                                              : s_distances_u32[idx_in_list + i * stride];
-    const Index_t row_document = find_in_row ? id : neighbs[i];
-    const Index_t row_query    = find_in_row ? neighbs[i] : id;
-    const float centered       = cuvs::preprocessing::quantize::bbq::centered_dot(
-      quantizer_document, quantizer_query, static_cast<float>(raw), row_document, row_query);
+    const Index_t varying_row  = neighbs[i];
+    const Index_t row_document = find_in_row ? id : varying_row;
+    const Index_t row_query    = find_in_row ? varying_row : id;
+
+    const float lower_var     = varying_view.lower_intervals(varying_row);
+    const float delta_var     = varying_view.dequant_delta(varying_row);
+    const float sum_delta_var = varying_view.dequant_sum_delta(varying_row);
+    // centered_dot's original two-view formula, split into the fixed (id) side's terms (looked
+    // up once above) and the varying (neighbs[i]) side's terms (looked up per call) -- the
+    // formula is symmetric in its two operands, so this is exact regardless of find_in_row.
+    const float centered = dim * lower_fixed * lower_var + lower_var * sum_delta_fixed +
+                           lower_fixed * sum_delta_var +
+                           delta_fixed * delta_var * static_cast<float>(raw);
     // Every metric below needs additional_corrections(doc) + additional_corrections(query): L2
     // directly, InnerProduct/Cosine via the reconstructed original-space dot product.
-    const float corrections = quantizer_document.additional_corrections(row_document) +
-                              quantizer_query.additional_corrections(row_query);
+    const float corrections = corrections_fixed + varying_view.additional_corrections(varying_row);
     float d;
     if (metric == cuvs::distance::DistanceType::L2Expanded ||
         metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
@@ -970,13 +976,16 @@ __device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
     } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
       d = -(centered + corrections - quantizer_document.centroid_norm_sq);
     } else {  // CosineExpanded
-      const float norm_product =
-        quantizer_document.row_norm(row_document) * quantizer_query.row_norm(row_query);
-      const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
-      d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+      const float norm_product = row_norm_fixed * varying_view.row_norm(varying_row);
+      const float dot          = centered + corrections - quantizer_document.centroid_norm_sq;
+      d                        = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
     }
     return dist_epilogue(d, row_document, row_query);
   };
+
+  const int lane_id = threadIdx.x % raft::warp_size();
+  int idx0          = lane_id;
+  int idx1          = raft::warp_size() + lane_id;
 
   float dist0 = compute_dist(idx0);
   float dist1 = compute_dist(idx1);
@@ -1552,15 +1561,15 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused(s_list[idx_in_list],
-                                       idx_in_list,
-                                       new_neighbors,
-                                       new_size,
-                                       s_distances_u32,
-                                       dataset_document,
-                                       dataset_query,
-                                       metric,
-                                       dist_epilogue);
+    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
+                                             idx_in_list,
+                                             new_neighbors,
+                                             new_size,
+                                             s_distances_u32,
+                                             dataset_document,
+                                             dataset_query,
+                                             metric,
+                                             dist_epilogue);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -1638,15 +1647,15 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused(s_list[idx_in_list],
-                                       idx_in_list,
-                                       old_neighbors,
-                                       old_size,
-                                       s_distances_u32,
-                                       dataset_document,
-                                       dataset_query,
-                                       metric,
-                                       dist_epilogue);
+    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
+                                             idx_in_list,
+                                             old_neighbors,
+                                             old_size,
+                                             s_distances_u32,
+                                             dataset_document,
+                                             dataset_query,
+                                             metric,
+                                             dist_epilogue);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -1656,16 +1665,15 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
     const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
-    auto min_elem      = get_min_item_fused(s_list[list_idx],
-                                       idx_in_list,
-                                       new_neighbors,
-                                       new_size,
-                                       s_distances_u32,
-                                       dataset_document,
-                                       dataset_query,
-                                       metric,
-                                       dist_epilogue,
-                                       false);
+    auto min_elem      = get_min_item_fused<false>(s_list[list_idx],
+                                              idx_in_list,
+                                              new_neighbors,
+                                              new_size,
+                                              s_distances_u32,
+                                              dataset_document,
+                                              dataset_query,
+                                              metric,
+                                              dist_epilogue);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
@@ -2064,28 +2072,22 @@ __launch_bounds__(BLOCK_SIZE)
   // list_idx indexes s_list (which id this row belongs to); idx_in_list is the row's position in
   // the distance matrix. They differ in phase 2's second branch, where the id comes from the
   // old-neighbour half of s_list but the matrix position is relative to the new half.
-  auto min_over =
-    [&](int list_idx, int idx_in_list, const Index_t* neighbs, int neighbs_size, bool find_in_row) {
-      return get_min_item_fused(s_list[list_idx],
-                                idx_in_list,
-                                neighbs,
-                                neighbs_size,
-                                s_distances_u32,
-                                dataset_document,
-                                dataset_query,
-                                metric,
-                                dist_epilogue,
-                                find_in_row,
-                                MMA_STORE_STRIDE);
-    };
-
   // ---- Phase 1: new x new ----
   run_phase(new_neighbors, new_size, std::integral_constant<bool, SelfJoin>{}, false);
 
   for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = min_over(idx_in_list, idx_in_list, new_neighbors, new_size, true);
+    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
+                                             idx_in_list,
+                                             new_neighbors,
+                                             new_size,
+                                             s_distances_u32,
+                                             dataset_document,
+                                             dataset_query,
+                                             metric,
+                                             dist_epilogue,
+                                             MMA_STORE_STRIDE);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -2103,7 +2105,16 @@ __launch_bounds__(BLOCK_SIZE)
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = min_over(idx_in_list, idx_in_list, old_neighbors, old_size, true);
+    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
+                                             idx_in_list,
+                                             old_neighbors,
+                                             old_size,
+                                             s_distances_u32,
+                                             dataset_document,
+                                             dataset_query,
+                                             metric,
+                                             dist_epilogue,
+                                             MMA_STORE_STRIDE);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -2113,7 +2124,16 @@ __launch_bounds__(BLOCK_SIZE)
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
     const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
-    auto min_elem      = min_over(list_idx, idx_in_list, new_neighbors, new_size, false);
+    auto min_elem      = get_min_item_fused<false>(s_list[list_idx],
+                                              idx_in_list,
+                                              new_neighbors,
+                                              new_size,
+                                              s_distances_u32,
+                                              dataset_document,
+                                              dataset_query,
+                                              metric,
+                                              dist_epilogue,
+                                              MMA_STORE_STRIDE);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }

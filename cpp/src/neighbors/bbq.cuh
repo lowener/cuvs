@@ -171,34 +171,6 @@ __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
 }
 
 // --------------------------------------------------------------------------
-// Metrics: (document x query)
-// Two quantizer views; the row lives in the document view, the column in the query view. A
-// self-join (symmetric case) is just this with dataset_document == dataset_query -- passing the
-// same view twice reproduces the old single-dataset formulas bit-for-bit, so there is no separate
-// symmetric code path.
-// --------------------------------------------------------------------------
-
-template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ float centered_dot(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
-  float code_ip,
-  int64_t row_document,
-  int64_t row_query)
-{
-  const float lower_doc     = dataset_document.lower_intervals(row_document);
-  const float lower_q       = dataset_query.lower_intervals(row_query);
-  const float delta_doc     = dataset_document.dequant_delta(row_document);
-  const float delta_q       = dataset_query.dequant_delta(row_query);
-  const float sum_delta_doc = dataset_document.dequant_sum_delta(row_document);
-  const float sum_delta_q   = dataset_query.dequant_sum_delta(row_query);
-
-  auto dim = static_cast<float>(dataset_document.dim());
-  return dim * lower_doc * lower_q + lower_q * sum_delta_doc + lower_doc * sum_delta_q +
-         delta_doc * delta_q * code_ip;
-}
-
-// --------------------------------------------------------------------------
 // Fused inner products (2x1)
 // Two left rows against a shared right operand, for the local-join inner loop.
 // --------------------------------------------------------------------------
