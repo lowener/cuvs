@@ -28,26 +28,32 @@ namespace preprocessing::quantize::bbq {
 /**
  * Storage layout of BBQ/OSQ quantized component codes in each dataset row.
  *
- * `single_bit` Binary-packed bitstream (packAsBinary). Used for bits == 1.
- * `dibit` matches Lucene's transposeDibit. Used for bits == 2.
- * `unsigned_byte` one uint8_t per component. Used for bits == 7 and 8.
+ * `packed_1b` Binary-packed bitstream (packAsBinary). Used for bits == 1.
+ * `transposed_2b` matches Lucene's transposeDibit. Used for bits == 2.
+ * `packed_8b` one uint8_t per component. Used for bits == 7 and 8.
  */
 enum class bbq_code_layout {
-  single_bit, /** Each dimension is quantized to a single bit and packed into bytes. Reflects
-               * OptimizedScalarQuantizer.packAsBinary. During query time, the query vector is
-               * quantized to 4 bits per dimension. */
-  dibit,      /** Each dimension is quantized to 2 bits (dibit) and packed into bytes. Reflects
-               * OptimizedScalarQuantizer.transposeDibit. During query time, the query vector is
-               * quantized to 4 bits per dimension. */
-  transpose_half_byte, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
-                        * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
-                        * every dimension is in the first set dimensions bits, or (dimensions/8)
-                        * bytes. The second, third, and fourth bits are in the second, third, and
-                        * fourth set of dimensions bits, respectively. Format used for queries. */
-  packed_nibble, /** Each dimension is quantized to 4 bits, two values are packed into each output
+  packed_1b,     /** Each dimension is quantized to a single bit and packed into bytes. Reflects
+                  * OptimizedScalarQuantizer.packAsBinary. During query time, the query vector is
+                  * quantized to 4 bits per dimension. */
+  transposed_2b, /** Each dimension is quantized to 2 bits, stored as 2 bitplanes.
+                  * Reflects OptimizedScalarQuantizer.transposeDibit. During query time, the query
+                  * vector is quantized to 4 bits per dimension. */
+  transposed_4b, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
+                  * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
+                  * every dimension is in the first set dimensions bits, or (dimensions/8)
+                  * bytes. The second, third, and fourth bits are in the second, third, and
+                  * fourth set of dimensions bits, respectively. Format used for queries. */
+  packed_4b,     /** Each dimension is quantized to 4 bits, two values are packed into each output
                   * byte. Reflects OffHeapScalarQuantizedVectorValues.packNibbles. */
-  seven_bit,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
-  unsigned_byte, /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
+  packed_2b,     /** Each dimension is quantized to 2 bits, four values (from consecutive
+                  * dimensions) are packed into each output byte -- the 2-bit analogue of
+                  * packed_4b's contiguous packing. Densely stored (4x smaller than storing
+                  * the same 2-bit codes in packed_4b's 4-bit-width slots); a bits=2
+                  * document in this layout must be promoted to 4-bit width before an int4 MMA
+                  * against a packed_4b query. */
+  packed_7b,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
+  packed_8b,     /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
 
 };
 template <typename DataT, typename IdxT, typename Accessor>
@@ -62,9 +68,20 @@ struct bbq_quantizer {
   dense_owning_vector<float, IdxT, Accessor> additional_corrections;
   dense_owning_vector<int32_t, IdxT, Accessor> quantized_component_sums;
   dense_owning_vector<DataT, IdxT, Accessor> centroid;
+  // Precomputed per-row dequantization factors, derived once (offline) from lower/upper_intervals
+  // and quantized_component_sums: dequant_delta = (upper-lower)/(2^bits-1), dequant_sum_delta =
+  // dequant_delta * quantized_component_sums. centered_dot() reads these directly instead of
+  // re-deriving them (division, subtraction, int->float cast) on every call.
+  dense_owning_vector<float, IdxT, Accessor> dequant_delta;
+  dense_owning_vector<float, IdxT, Accessor> dequant_sum_delta;
+  // Squared norm of the row in original (un-centered) vector space, ||x||^2 -- precomputed once
+  // (offline) since it's a function of the raw input, not derivable from the other stored
+  // per-row scalars. Used by CosineExpanded, previously recomputed on-device every NN-descent
+  // local-join call via row_norm()/bbq_row_norm_op; now just a per-row lookup.
+  dense_owning_vector<float, IdxT, Accessor> row_norm;
 
   uint32_t bits{};
-  bbq_code_layout layout{bbq_code_layout::single_bit};
+  bbq_code_layout layout{bbq_code_layout::packed_1b};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
@@ -74,6 +91,9 @@ struct bbq_quantizer {
                 dense_owning_vector<float, IdxT, Accessor>&& additional_corrections,
                 dense_owning_vector<int32_t, IdxT, Accessor>&& quantized_component_sums,
                 dense_owning_vector<DataT, IdxT, Accessor>&& centroid,
+                dense_owning_vector<float, IdxT, Accessor>&& dequant_delta,
+                dense_owning_vector<float, IdxT, Accessor>&& dequant_sum_delta,
+                dense_owning_vector<float, IdxT, Accessor>&& row_norm,
                 uint32_t bits,
                 bbq_code_layout layout,
                 cuvs::distance::DistanceType metric,
@@ -84,6 +104,9 @@ struct bbq_quantizer {
       additional_corrections{std::move(additional_corrections)},
       quantized_component_sums{std::move(quantized_component_sums)},
       centroid{std::move(centroid)},
+      dequant_delta{std::move(dequant_delta)},
+      dequant_sum_delta{std::move(dequant_sum_delta)},
+      row_norm{std::move(row_norm)},
       bits{bits},
       layout{layout},
       metric{metric},
@@ -95,7 +118,9 @@ struct bbq_quantizer {
                  "BBQ code row length does not match dim, bits, and layout.");
     RAFT_EXPECTS(lower_intervals.extent(0) == n_rows && upper_intervals.extent(0) == n_rows &&
                    additional_corrections.extent(0) == n_rows &&
-                   quantized_component_sums.extent(0) == n_rows,
+                   quantized_component_sums.extent(0) == n_rows &&
+                   dequant_delta.extent(0) == n_rows && dequant_sum_delta.extent(0) == n_rows &&
+                   row_norm.extent(0) == n_rows,
                  "Every BBQ correction array must contain one value per row.");
   }
 
@@ -108,12 +133,13 @@ struct bbq_quantizer {
   {
     auto const d = dim();
     switch (layout) {
-      case bbq_code_layout::single_bit: return (d * bits + 7) / 8;
-      case bbq_code_layout::dibit: return bits * ((d + 7) / 8);
-      case bbq_code_layout::packed_nibble: return (d + 1) / 2;
-      case bbq_code_layout::seven_bit: return d;
-      case bbq_code_layout::unsigned_byte: return d;
-      case bbq_code_layout::transpose_half_byte: return 4 * ((d + 7) / 8);
+      case bbq_code_layout::packed_1b: return (d * bits + 7) / 8;
+      case bbq_code_layout::transposed_2b: return bits * ((d + 7) / 8);
+      case bbq_code_layout::packed_4b: return (d + 1) / 2;
+      case bbq_code_layout::packed_2b: return (d + 3) / 4;
+      case bbq_code_layout::packed_7b: return d;
+      case bbq_code_layout::packed_8b: return d;
+      case bbq_code_layout::transposed_4b: return 4 * ((d + 7) / 8);
     }
     return 0;
   }
@@ -134,9 +160,12 @@ struct bbq_quantizer_view {
   dense_view_vector<const float, IdxT, Accessor> additional_corrections;
   dense_view_vector<const int32_t, IdxT, Accessor> quantized_component_sums;
   dense_view_vector<const DataT, IdxT, Accessor> centroid;
+  dense_view_vector<const float, IdxT, Accessor> dequant_delta;
+  dense_view_vector<const float, IdxT, Accessor> dequant_sum_delta;
+  dense_view_vector<const float, IdxT, Accessor> row_norm;
 
   uint32_t bits{};
-  bbq_code_layout layout{bbq_code_layout::single_bit};
+  bbq_code_layout layout{bbq_code_layout::packed_1b};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
@@ -147,6 +176,9 @@ struct bbq_quantizer_view {
       additional_corrections{quantizer.additional_corrections.view()},
       quantized_component_sums{quantizer.quantized_component_sums.view()},
       centroid{quantizer.centroid.view()},
+      dequant_delta{quantizer.dequant_delta.view()},
+      dequant_sum_delta{quantizer.dequant_sum_delta.view()},
+      row_norm{quantizer.row_norm.view()},
       bits{quantizer.bits},
       layout{quantizer.layout},
       metric{quantizer.metric},

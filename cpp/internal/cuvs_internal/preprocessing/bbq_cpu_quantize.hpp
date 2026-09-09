@@ -25,6 +25,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -174,18 +175,19 @@ inline row_result scalar_quantize(std::vector<float>& vector,
 inline size_t encoded_row_length(size_t dim, uint32_t bits, bbq_code_layout layout)
 {
   switch (layout) {
-    case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
-    case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
-    case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
-    case bbq_code_layout::seven_bit: return dim;
-    case bbq_code_layout::unsigned_byte: return dim;
-    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
+    case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
+    case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
+    case bbq_code_layout::packed_2b: return (dim + 3) / 4;
+    case bbq_code_layout::packed_4b: return (dim + 1) / 2;
+    case bbq_code_layout::packed_7b: return dim;
+    case bbq_code_layout::packed_8b: return dim;
+    case bbq_code_layout::transposed_4b: return 4 * ((dim + 7) / 8);
   }
   return 0;
 }
 
-// Packs one-byte-per-component codes into single_bit / dibit / packed_nibble /
-// transpose_half_byte (or leaves unpacked). Matches Lucene packAsBinary,
+// Packs one-byte-per-component codes into packed_1b / packed_2b / transposed_2b /
+// packed_4b / transposed_4b (or leaves unpacked). Matches Lucene packAsBinary,
 // packNibbles, transposeDibit, transposeHalfByte.
 inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
                                        size_t n_rows,
@@ -194,7 +196,7 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
                                        bbq_code_layout layout)
 {
   const size_t row_length = encoded_row_length(dim, bits, layout);
-  if (layout == bbq_code_layout::unsigned_byte || layout == bbq_code_layout::seven_bit) {
+  if (layout == bbq_code_layout::packed_8b || layout == bbq_code_layout::packed_7b) {
     return unpacked;
   }
 
@@ -203,24 +205,38 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
   for (int64_t row = 0; row < static_cast<int64_t>(n_rows); ++row) {
     auto* output      = packed.data() + static_cast<size_t>(row) * row_length;
     const auto* input = unpacked.data() + static_cast<size_t>(row) * dim;
-    if (layout == bbq_code_layout::packed_nibble) {
-      // Lucene OffHeapScalarQuantizedVectorValues.packNibbles
-      const size_t half = dim / 2;
-      for (size_t i = 0; i < half; ++i) {
-        output[i] = static_cast<uint8_t>((input[i] << 4) | (input[half + i] & 0x0f));
+    if (layout == bbq_code_layout::packed_4b) {
+      // Contiguous: dims 2k / 2k+1 share byte k. NOT Lucene packNibbles, which pairs dim i with
+      // dim dim/2 + i. A self-join is position-agnostic so either works there, but an asymmetric
+      // pair (packed_1b or packed_2b document promoted to 4-bit width against this query) needs
+      // dimension k of both operands in the same slot -- halves-pairing silently multiplies
+      // mismatched dimensions and costs recall.
+      const size_t pairs = dim / 2;
+      for (size_t i = 0; i < pairs; ++i) {
+        output[i] = static_cast<uint8_t>((input[2 * i] << 4) | (input[2 * i + 1] & 0x0f));
+      }
+      continue;
+    }
+    if (layout == bbq_code_layout::packed_2b) {
+      // Dense 2-bit: four consecutive dimensions per byte, most significant
+      // first. Not a bit-plane layout, so it must not fall through below.
+      const size_t quads = dim / 4;
+      for (size_t i = 0; i < quads; ++i) {
+        output[i] = static_cast<uint8_t>((input[4 * i] << 6) | (input[4 * i + 1] << 4) |
+                                         (input[4 * i + 2] << 2) | input[4 * i + 3]);
       }
       continue;
     }
     for (size_t d = 0; d < dim; ++d) {
       const uint8_t code = input[d];
-      if (layout == bbq_code_layout::single_bit) {
+      if (layout == bbq_code_layout::packed_1b) {
         for (uint32_t bit = 0; bit < bits; ++bit) {
           const size_t position = d * bits + bit;
           output[position / 8] |=
             static_cast<uint8_t>(((code >> (bits - 1 - bit)) & 1u) << (7 - position % 8));
         }
       } else {
-        // dibit / transpose_half_byte bit-planes (LSB plane first)
+        // transposed_2b / transposed_4b bit-planes (LSB plane first)
         const size_t stripe = (dim + 7) / 8;
         for (uint32_t bit = 0; bit < bits; ++bit) {
           output[bit * stripe + d / 8] |= static_cast<uint8_t>(((code >> bit) & 1u) << (7 - d % 8));
@@ -236,7 +252,7 @@ inline host_storage quantize(const float* data,
                              int64_t dim,
                              uint8_t bits,
                              cuvs::distance::DistanceType metric,
-                             bbq_code_layout layout = bbq_code_layout::unsigned_byte)
+                             bbq_code_layout layout = bbq_code_layout::packed_8b)
 {
   const bool euclidean = metric == cuvs::distance::DistanceType::L2Expanded ||
                          metric == cuvs::distance::DistanceType::L2SqrtExpanded;
@@ -259,17 +275,34 @@ inline host_storage quantize(const float* data,
   auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
   auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
   auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
+  // Per-row dequantization factors, derived here (offline, once) so centered_dot() on the device
+  // never has to re-derive them from lower/upper_intervals and quantized_component_sums.
+  auto dequant_delta        = raft::make_host_vector<float, int64_t>(n_rows);
+  auto dequant_sum_delta    = raft::make_host_vector<float, int64_t>(n_rows);
+  const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
+  // Squared norm of the row in original (pre-centering) space -- needed by CosineExpanded, not
+  // derivable from `additional_corrections` (that's the centered/residual norm for the euclidean
+  // metric, or a centroid dot product otherwise), so computed here directly from `data`.
+  auto row_norm = raft::make_host_vector<float, int64_t>(n_rows);
 
 #pragma omp parallel for
   for (int64_t i = 0; i < n_rows; ++i) {
     std::vector<float> row(data + i * dim, data + (i + 1) * dim);
     std::vector<uint8_t> codes(dim);
+    float orig_norm2 = 0.0f;
+    for (int64_t d = 0; d < dim; ++d) {
+      orig_norm2 += row[d] * row[d];
+    }
+    row_norm(i)       = orig_norm2;
     const auto result = scalar_quantize(row, codes, bits, centroid.data_handle(), euclidean);
     std::copy(codes.begin(), codes.end(), unpacked.begin() + i * dim);
     lower_intervals(i)          = result.lower_interval;
     upper_intervals(i)          = result.upper_interval;
     additional_corrections(i)   = result.additional_correction;
     quantized_component_sums(i) = result.quantized_component_sum;
+    const float delta           = (result.upper_interval - result.lower_interval) * dequant_scale;
+    dequant_delta(i)            = delta;
+    dequant_sum_delta(i)        = delta * static_cast<float>(result.quantized_component_sum);
   }
 
   auto packed =
@@ -284,6 +317,9 @@ inline host_storage quantize(const float* data,
                       std::move(additional_corrections),
                       std::move(quantized_component_sums),
                       std::move(centroid),
+                      std::move(dequant_delta),
+                      std::move(dequant_sum_delta),
+                      std::move(row_norm),
                       static_cast<uint32_t>(bits),
                       layout,
                       metric,
@@ -296,7 +332,7 @@ inline host_storage quantize(const std::vector<float>& data,
                              int64_t dim,
                              uint8_t bits,
                              cuvs::distance::DistanceType metric,
-                             bbq_code_layout layout = bbq_code_layout::unsigned_byte)
+                             bbq_code_layout layout = bbq_code_layout::packed_8b)
 {
   return quantize(data.data(), n_rows, dim, bits, metric, layout);
 }
@@ -319,6 +355,11 @@ auto copy_bbq_owning_storage_host_to_device(
   auto quantized_component_sums =
     raft::make_device_vector<int32_t, IdxT>(res, host_storage.quantized_component_sums.extent(0));
   auto centroid = raft::make_device_vector<float, IdxT>(res, host_storage.centroid.extent(0));
+  auto dequant_delta =
+    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_delta.extent(0));
+  auto dequant_sum_delta =
+    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_sum_delta.extent(0));
+  auto row_norm = raft::make_device_vector<float, IdxT>(res, host_storage.row_norm.extent(0));
 
   raft::copy(codes.data_handle(), host_storage.codes.data_handle(), codes.size(), stream);
   raft::copy(lower_intervals.data_handle(),
@@ -338,6 +379,15 @@ auto copy_bbq_owning_storage_host_to_device(
              quantized_component_sums.size(),
              stream);
   raft::copy(centroid.data_handle(), host_storage.centroid.data_handle(), centroid.size(), stream);
+  raft::copy(dequant_delta.data_handle(),
+             host_storage.dequant_delta.data_handle(),
+             dequant_delta.size(),
+             stream);
+  raft::copy(dequant_sum_delta.data_handle(),
+             host_storage.dequant_sum_delta.data_handle(),
+             dequant_sum_delta.size(),
+             stream);
+  raft::copy(row_norm.data_handle(), host_storage.row_norm.data_handle(), row_norm.size(), stream);
 
   return {std::move(codes),
           std::move(lower_intervals),
@@ -345,6 +395,9 @@ auto copy_bbq_owning_storage_host_to_device(
           std::move(additional_corrections),
           std::move(quantized_component_sums),
           std::move(centroid),
+          std::move(dequant_delta),
+          std::move(dequant_sum_delta),
+          std::move(row_norm),
           host_storage.bits,
           host_storage.layout,
           host_storage.metric,
@@ -365,35 +418,68 @@ auto make_device_bbq_dataset(raft::resources const& res,
   return device;
 }
 
-/** The one packing each supported code width is stored in. */
-inline auto layout_for_bits(uint32_t bits) -> bbq_code_layout
+struct bbq_layout_token {
+  std::string_view token;
+  uint32_t bits;
+  bbq_code_layout layout;
+};
+
+// Same convention as my_tests/bbq's CLI tokens: bare N = densely packed (tensor-core-eligible),
+// N + "t" = transposed/bitplane (SIMT). At 1 bit the two coincide, so there is no "1t".
+constexpr bbq_layout_token kBbqLayoutTokens[] = {
+  {"1", 1, bbq_code_layout::packed_1b},
+  {"2", 2, bbq_code_layout::packed_2b},
+  {"4", 4, bbq_code_layout::packed_4b},
+  {"2t", 2, bbq_code_layout::transposed_2b},
+  {"4t", 4, bbq_code_layout::transposed_4b},
+  {"7", 7, bbq_code_layout::packed_7b},
+  {"8", 8, bbq_code_layout::packed_8b},
+};
+
+/** Parses a layout token into its (bits, layout) pair -- the layout is no longer derivable from
+ *  bits alone, since e.g. bits=4 is ambiguous between packed_4b and transposed_4b. */
+inline auto parse_bbq_layout_token(std::string_view token) -> std::pair<uint32_t, bbq_code_layout>
 {
-  switch (bits) {
-    case 1: return bbq_code_layout::single_bit;
-    case 2: return bbq_code_layout::dibit;
-    case 4: return bbq_code_layout::transpose_half_byte;
-    case 7: return bbq_code_layout::seven_bit;
-    case 8: return bbq_code_layout::unsigned_byte;
-    default: RAFT_FAIL("BBQ bits must be one of 1, 2, 4, 7 or 8; got %u.", bits);
+  for (const auto& t : kBbqLayoutTokens) {
+    if (t.token == token) { return {t.bits, t.layout}; }
   }
+  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2, 4, 2t, 4t, 7, 8.",
+            std::string(token).c_str());
 }
 
 /**
- * Reject pairs the kernels cannot serve. Without this the library silently falls back to a
- * symmetric join on the first quantizer, which looks like a working asymmetric run.
+ * Reject layout pairs the local-join kernels cannot serve. Without this the library either
+ * silently falls back to a symmetric join on the first quantizer (which looks like a working
+ * asymmetric run), or reaches an unsupported-layout failure deep inside GNND::build. Must be kept
+ * in sync with the dispatch in GNND<Data_t, Index_t>::local_join (nn_descent.cuh).
  */
-inline void validate_bits(uint32_t query_bits, uint32_t doc_bits)
+inline void validate_layout_pair(bbq_code_layout query_layout, bbq_code_layout doc_layout)
 {
-  (void)layout_for_bits(query_bits);
-  (void)layout_for_bits(doc_bits);
-  if (query_bits == doc_bits) { return; }
-  const bool supported = (query_bits == 2 && doc_bits == 1) || (query_bits == 4 && doc_bits == 1) ||
-                         (query_bits == 4 && doc_bits == 2);
+  if (query_layout == doc_layout) {
+    const bool supported = query_layout == bbq_code_layout::packed_1b ||
+                           query_layout == bbq_code_layout::transposed_2b ||
+                           query_layout == bbq_code_layout::packed_4b ||
+                           query_layout == bbq_code_layout::packed_7b ||
+                           query_layout == bbq_code_layout::packed_8b;
+    RAFT_EXPECTS(supported,
+                 "Symmetric BBQ NN-Descent has no local-join kernel for layout %d -- packed_2b "
+                 "and transposed_4b are only supported as one side of an asymmetric pair.",
+                 static_cast<int>(query_layout));
+    return;
+  }
+  const bool supported =
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::packed_4b) ||
+    (doc_layout == bbq_code_layout::packed_2b && query_layout == bbq_code_layout::packed_4b) ||
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_2b) ||
+    (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_4b) ||
+    (doc_layout == bbq_code_layout::transposed_2b &&
+     query_layout == bbq_code_layout::transposed_4b);
   RAFT_EXPECTS(supported,
-               "Asymmetric BBQ NN-Descent supports only (query_bits, doc_bits) of (2, 1), (4, 1) "
-               "or (4, 2); got (%u, %u).",
-               query_bits,
-               doc_bits);
+               "Asymmetric BBQ NN-Descent supports only (doc, query) layouts of (packed_1b, "
+               "packed_4b), (packed_2b, packed_4b), (packed_1b, transposed_2b), (packed_1b, "
+               "transposed_4b), or (transposed_2b, transposed_4b); got (%d, %d).",
+               static_cast<int>(doc_layout),
+               static_cast<int>(query_layout));
 }
 
 /** Every parameter that affects the codes is in the name, so the cache self-invalidates. */
@@ -420,6 +506,9 @@ void for_each_buffer(host_storage& q, OpT op)
   op(q.additional_corrections.data_handle(), q.additional_corrections.size() * sizeof(float));
   op(q.quantized_component_sums.data_handle(), q.quantized_component_sums.size() * sizeof(int32_t));
   op(q.centroid.data_handle(), q.centroid.size() * sizeof(float));
+  // Unlike dequant_delta/dequant_sum_delta, row_norm (original-space ||x||^2) isn't derivable
+  // from the other cached fields, so it has to round-trip through the cache.
+  op(q.row_norm.data_handle(), q.row_norm.size() * sizeof(float));
 }
 
 /** Allocates the arrays of the given shape, leaving their contents undefined. */
@@ -436,6 +525,9 @@ inline auto make_host_storage(int64_t n_rows,
                       raft::make_host_vector<float, int64_t>(n_rows),
                       raft::make_host_vector<int32_t, int64_t>(n_rows),
                       raft::make_host_vector<float, int64_t>(dim),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(n_rows),
+                      raft::make_host_vector<float, int64_t>(n_rows),
                       bits,
                       layout,
                       metric,
@@ -466,9 +558,17 @@ inline auto cache_load(const std::string& path,
     RAFT_LOG_WARN("Failed to read BBQ cache, re-quantizing: %s", path.c_str());
     return std::nullopt;
   }
-  // Cheaper to recompute than to store and validate.
+  // Cheaper to recompute than to store and validate. dequant_delta/dequant_sum_delta are likewise
+  // a deterministic function of the cached lower/upper_intervals, quantized_component_sums, and
+  // bits, so they are recomputed here rather than added to the on-disk layout.
   for (int64_t d = 0; d < dim; ++d) {
     q.centroid_norm_sq += q.centroid(d) * q.centroid(d);
+  }
+  const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
+  for (int64_t i = 0; i < n_rows; ++i) {
+    const float delta      = (q.upper_intervals(i) - q.lower_intervals(i)) * dequant_scale;
+    q.dequant_delta(i)     = delta;
+    q.dequant_sum_delta(i) = delta * static_cast<float>(q.quantized_component_sums(i));
   }
   RAFT_LOG_INFO("Loaded BBQ codes from %s", path.c_str());
   return q;
@@ -506,10 +606,10 @@ inline auto quantize_cached(const float* rows,
                             int64_t n_rows,
                             int64_t dim,
                             uint32_t bits,
+                            bbq_code_layout layout,
                             cuvs::distance::DistanceType metric) -> host_storage
 {
-  const auto layout = layout_for_bits(bits);
-  const auto path   = cache_path(n_rows, dim, bits, layout, metric);
+  const auto path = cache_path(n_rows, dim, bits, layout, metric);
   if (auto cached = cache_load(path, n_rows, dim, bits, layout, metric)) {
     return std::move(*cached);
   }
@@ -521,7 +621,7 @@ inline auto quantize_cached(const float* rows,
 /**
  * Quantize host-resident @p rows and upload the codes, ready for the BBQ NN-Descent build.
  *
- * `query_bits == doc_bits` produces a single quantizer and a symmetric join; differing widths
+ * `query_token == doc_token` produces a single quantizer and a symmetric join; differing tokens
  * produce two quantizers and an asymmetric join, where the wider codes serve the query side.
  */
 inline auto quantize_to_device(raft::resources const& res,
@@ -529,14 +629,17 @@ inline auto quantize_to_device(raft::resources const& res,
                                int64_t n_rows,
                                int64_t dim,
                                cuvs::distance::DistanceType metric,
-                               uint32_t query_bits,
-                               uint32_t doc_bits) -> cuvs::neighbors::device_bbq_dataset<int64_t>
+                               std::string_view query_token,
+                               std::string_view doc_token)
+  -> cuvs::neighbors::device_bbq_dataset<int64_t>
 {
-  validate_bits(query_bits, doc_bits);
+  const auto [query_bits, query_layout] = parse_bbq_layout_token(query_token);
+  const auto [doc_bits, doc_layout]     = parse_bbq_layout_token(doc_token);
+  validate_layout_pair(query_layout, doc_layout);
   cuvs::neighbors::host_bbq_dataset<int64_t> host{
-    quantize_cached(rows, n_rows, dim, query_bits, metric)};
-  if (doc_bits != query_bits) {
-    host.add_quantizer(quantize_cached(rows, n_rows, dim, doc_bits, metric));
+    quantize_cached(rows, n_rows, dim, query_bits, query_layout, metric)};
+  if (doc_token != query_token) {
+    host.add_quantizer(quantize_cached(rows, n_rows, dim, doc_bits, doc_layout, metric));
   }
   auto device = make_device_bbq_dataset<int64_t>(res, host);
   // The uploads are stream-ordered against `host`, which dies with this frame.

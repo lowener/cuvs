@@ -166,10 +166,12 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
     using dataset_dependent_params = std::function<cuvs::neighbors::cagra::index_params(
       raft::matrix_extent<int64_t>, cuvs::distance::DistanceType)>;
     dataset_dependent_params cagra_params;
-    /** Prototype: run the NN-Descent graph build on BBQ codes of these widths. */
+    /** Prototype: run the NN-Descent graph build on BBQ codes of these layouts. Tokens follow
+     *  my_tests/bbq's CLI convention: bare N = densely packed (tensor-core), N + "t" =
+     *  transposed (SIMT), e.g. "4" (packed_4b) vs. "4t" (transposed_4b). */
     struct bbq_param {
-      uint32_t query_bits;
-      uint32_t doc_bits;
+      std::string query_format;
+      std::string doc_format;
     };
     std::optional<bbq_param> bbq                           = std::nullopt;
     std::optional<cuvs::neighbors::vpq_params> compression = std::nullopt;
@@ -206,8 +208,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
                                                  static_cast<int64_t>(nrow),
                                                  static_cast<int64_t>(dim_),
                                                  parse_metric_type(metric_),
-                                                 index_params_.bbq->query_bits,
-                                                 index_params_.bbq->doc_bits));
+                                                 index_params_.bbq->query_format,
+                                                 index_params_.bbq->doc_format));
       }
     }
   }
