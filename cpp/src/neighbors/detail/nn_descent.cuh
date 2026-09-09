@@ -468,7 +468,8 @@ __device__ ResultItem<Index_t> get_min_item(const Index_t id,
                                             const Index_t* neighbs,
                                             const DistData_t* distances,
                                             const bool find_in_row = true,
-                                            const int stride       = SKEWED_MAX_NUM_BI_SAMPLES)
+                                            const int stride       = SKEWED_MAX_NUM_BI_SAMPLES,
+                                            const int neighbs_size = MAX_NUM_BI_SAMPLES)
 {
   int lane_id = threadIdx.x % raft::warp_size();
 
@@ -479,12 +480,16 @@ __device__ ResultItem<Index_t> get_min_item(const Index_t id,
   idx[0]                                             = lane_id;
   idx[1]                                             = raft::warp_size() + lane_id;
 
-  if (neighbs[idx[0]] != id) {
+  // neighbs_size defaults to the full width, so existing (dense/calculate_metric-based) callers
+  // that pre-fill `distances` out to MAX_NUM_BI_SAMPLES are unaffected. Callers that don't pre-fill
+  // (e.g. the BBQ SIMT kernel, which only ever writes real cells) pass the real list size instead,
+  // so out-of-range entries just never get read -- cheaper than a separate fill pass.
+  if (idx[0] < neighbs_size && neighbs[idx[0]] != id) {
     dist[0] = find_in_row ? distances[idx_in_list * stride + lane_id]
                           : distances[idx_in_list + lane_id * stride];
   }
 
-  if (neighbs[idx[1]] != id) {
+  if (idx[1] < neighbs_size && neighbs[idx[1]] != id) {
     dist[1] = find_in_row ? distances[idx_in_list * stride + raft::warp_size() + lane_id]
                           : distances[idx_in_list + (raft::warp_size() + lane_id) * stride];
   }
@@ -896,10 +901,10 @@ __launch_bounds__(BLOCK_SIZE)
 #endif
 }
 
-// Per-row dequantization terms needed by get_min_item_fused's compute_dist for the varying side.
-// 4 floats = 16 B/row, exactly one vectorized LDS/STS.128 -- row_norm is deliberately excluded
-// (only CosineExpanded needs it) and cached separately so the common L2/InnerProduct case doesn't
-// pay for staging or reading it.
+// Per-row dequantization terms needed by bbq_calculate_metric. 4 floats = 16 B/row, exactly one
+// vectorized LDS/STS.128 -- row_norm is deliberately excluded (only CosineExpanded needs it) and
+// read directly from the quantizer view instead, since register pressure in the BBQ local-join
+// kernels is already tight.
 struct bbq_dequant_factors {
   float lower;
   float delta;
@@ -907,132 +912,60 @@ struct bbq_dequant_factors {
   float corrections;
 };
 
-// Fused replacement for calculate_metric_bbq_* + get_min_item, used by every BBQ local-join
-// kernel: s_distances_u32 already holds the raw dot products (fully written and visible after the
-// K-loop's __syncthreads()), so distances are converted to float inline, in registers, right
-// before the warp min-reduction, instead of a separate full-grid conversion pass. This is a trade,
-// not a free win -- phase 2 reads each matrix entry once per row-sweep (find_in_row=true) and once
-// per column-sweep (find_in_row=false), so it pays 2x the metric arithmetic for the removed SMEM
-// traffic/barrier. See TENSOR_CORE_NOTES.md for current per-kernel measurements.
-//
-// One function covers both symmetric and asymmetric: passing quantizer_document == quantizer_query
-// reproduces the old single-quantizer centered-dot formula bit-for-bit. The plain (non-fused)
-// get_min_item is untouched, still used by local_join_kernel_simt, the scalar
-// local_join_kernel_bbq_simt, and local_join_kernel_wmma.
-//
-// Row/col semantics: `id`/`idx_in_list` name one fixed axis, `neighbs` the varying one.
-// s_distances_u32 is always [row=document][col=query]; find_in_row (a template parameter, so the
-// two variants are specialized and compiled independently) picks which axis is fixed vs. swept, so
-// which of (id, neighbs[idx]) is the document vs. the query flips with it (moot when symmetric).
-template <bool find_in_row, typename DataT, typename Index_t, typename DistEpilogue_t>
-__device__ inline ResultItem<Index_t> get_min_item_fused(
-  const Index_t id,
-  const int idx_in_list,
-  const Index_t* neighbs,
-  const int neighbs_size,
-  const uint32_t* s_distances_u32,
-  const bbq_device_quantizer_view<DataT, int64_t> quantizer_document,
-  const bbq_device_quantizer_view<DataT, int64_t> quantizer_query,
+// Converts one raw BBQ dot product into a final (post-epilogue) float distance, given both
+// operands' precomputed dequant factors. Evaluated exactly once per matrix cell, right when a
+// cell's raw total is ready, folded into the single SMEM write that materializes the local-join
+// distance matrix (see local_join_kernel_bbq_simt's store loop and
+// local_join_kernel_bbq_wmma's run_phase conversion loop) -- as opposed to lazily, once per read,
+// which is what an earlier version of this code (get_min_item_fused) paid for phase 2's two sweep
+// directions over the same matrix.
+// dim/centroid_norm_sq/row_norm both come directly from quantizer_document/quantizer_query rather
+// than being passed separately, since every caller reads them the same id-indexed way -- row_norm
+// is only read for CosineExpanded (skipped entirely otherwise). document_id/query_id are also
+// forwarded to dist_epilogue, not used for self-suppression -- callers that need that (i.e. the
+// equivalent of compute_dist's `neighbs[i] == id` check) must do it themselves, or rely on
+// get_min_item's own id-based check at read time when the value being suppressed is never
+// actually read back.
+template <typename DataT, typename Index_t, typename DistEpilogue_t>
+__device__ __forceinline__ float bbq_calculate_metric(
+  uint32_t raw,
+  const bbq_dequant_factors& doc_factors,
+  const bbq_dequant_factors& query_factors,
+  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_document,
+  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_query,
   cuvs::distance::DistanceType metric,
   DistEpilogue_t dist_epilogue,
-  const int stride                             = SKEWED_MAX_NUM_BI_SAMPLES,
-  const bbq_dequant_factors* s_varying_factors = nullptr)
+  Index_t document_id,
+  Index_t query_id)
 {
   constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
-
-  static_assert(MAX_NUM_BI_SAMPLES == 64);
-
-  // `id`'s side is the same row for both compute_dist calls below (and warp-uniform across the
-  // whole call) -- find_in_row picks whether that's the document or the query side. Its per-row
-  // terms are looked up once here instead of once per compute_dist call.
-  const auto& fixed_view        = find_in_row ? quantizer_document : quantizer_query;
-  const auto& varying_view      = find_in_row ? quantizer_query : quantizer_document;
-  const float lower_fixed       = fixed_view.lower_intervals(id);
-  const float delta_fixed       = fixed_view.dequant_delta(id);
-  const float sum_delta_fixed   = fixed_view.dequant_sum_delta(id);
-  const float corrections_fixed = fixed_view.additional_corrections(id);
-  // Only CosineExpanded needs this; metric is the same for every thread in the kernel, so this
-  // branch costs no divergence and skips the load entirely for L2/InnerProduct launches.
-  const float row_norm_fixed =
-    metric == cuvs::distance::DistanceType::CosineExpanded ? fixed_view.row_norm(id) : 0.0f;
   const float dim = static_cast<float>(quantizer_document.dim());
-
-  auto compute_dist = [&](int i) -> float {
-    if (i >= neighbs_size || neighbs[i] == id) { return std::numeric_limits<DistData_t>::max(); }
-    const uint32_t raw         = find_in_row ? s_distances_u32[idx_in_list * stride + i]
-                                             : s_distances_u32[idx_in_list + i * stride];
-    const Index_t varying_row  = neighbs[i];
-    const Index_t row_document = find_in_row ? id : varying_row;
-    const Index_t row_query    = find_in_row ? varying_row : id;
-
-    // s_varying_factors, when provided, was staged once per (loop, varying list) by the caller --
-    // avoids re-fetching the same up-to-64 rows' factors from global memory on every idx_in_list
-    // iteration (up to 64x redundant scattered gather otherwise, see the caller for details).
-    float lower_var, delta_var, sum_delta_var, corrections_var;
-    if (s_varying_factors) {
-      const bbq_dequant_factors& f = s_varying_factors[i];
-      lower_var                    = f.lower;
-      delta_var                    = f.delta;
-      sum_delta_var                = f.sum_delta;
-      corrections_var              = f.corrections;
-    } else {
-      lower_var       = varying_view.lower_intervals(varying_row);
-      delta_var       = varying_view.dequant_delta(varying_row);
-      sum_delta_var   = varying_view.dequant_sum_delta(varying_row);
-      corrections_var = varying_view.additional_corrections(varying_row);
+  // Symmetric in its two operands, so this is exact regardless of which side is "document" vs.
+  // "query".
+  const float centered = dim * doc_factors.lower * query_factors.lower +
+                         query_factors.lower * doc_factors.sum_delta +
+                         doc_factors.lower * query_factors.sum_delta +
+                         doc_factors.delta * query_factors.delta * static_cast<float>(raw);
+  // Every metric below needs additional_corrections(doc) + additional_corrections(query): L2
+  // directly, InnerProduct/Cosine via the reconstructed original-space dot product.
+  const float corrections = doc_factors.corrections + query_factors.corrections;
+  float d;
+  if (metric == cuvs::distance::DistanceType::L2Expanded ||
+      metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+    const float raw_distance = corrections - 2.0f * centered;
+    d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
+    if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+      d = sqrtf(d);
     }
-    // centered_dot's original two-view formula, split into the fixed (id) side's terms (looked
-    // up once above) and the varying (neighbs[i]) side's terms (looked up per call) -- the
-    // formula is symmetric in its two operands, so this is exact regardless of find_in_row.
-    const float centered = dim * lower_fixed * lower_var + lower_var * sum_delta_fixed +
-                           lower_fixed * sum_delta_var +
-                           delta_fixed * delta_var * static_cast<float>(raw);
-    // Every metric below needs additional_corrections(doc) + additional_corrections(query): L2
-    // directly, InnerProduct/Cosine via the reconstructed original-space dot product.
-    const float corrections = corrections_fixed + corrections_var;
-    float d;
-    if (metric == cuvs::distance::DistanceType::L2Expanded ||
-        metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-      const float raw_distance = corrections - 2.0f * centered;
-      d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
-      if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-        d = sqrtf(d);
-      }
-    } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-      d = -(centered + corrections - quantizer_document.centroid_norm_sq);
-    } else {  // CosineExpanded
-      const float norm_product = row_norm_fixed * varying_view.row_norm(varying_row);
-      const float dot          = centered + corrections - quantizer_document.centroid_norm_sq;
-      d                        = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
-    }
-    return dist_epilogue(d, row_document, row_query);
-  };
-
-  const int lane_id = threadIdx.x % raft::warp_size();
-  int idx0          = lane_id;
-  int idx1          = raft::warp_size() + lane_id;
-
-  float dist0 = compute_dist(idx0);
-  float dist1 = compute_dist(idx1);
-
-  if (dist1 < dist0) {
-    dist0 = dist1;
-    idx0  = idx1;
+  } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    d = -(centered + corrections - quantizer_document.centroid_norm_sq);
+  } else {  // CosineExpanded
+    const float norm_product =
+      quantizer_document.row_norm(document_id) * quantizer_query.row_norm(query_id);
+    const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
+    d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
   }
-  __syncwarp();
-  for (int offset = raft::warp_size() >> 1; offset >= 1; offset >>= 1) {
-    float other_idx  = __shfl_down_sync(raft::warp_full_mask(), idx0, offset);
-    float other_dist = __shfl_down_sync(raft::warp_full_mask(), dist0, offset);
-    if (other_dist < dist0) {
-      dist0 = other_dist;
-      idx0  = other_idx;
-    }
-  }
-
-  ResultItem<Index_t> result;
-  result.dist()         = __shfl_sync(raft::warp_full_mask(), dist0, 0);
-  result.id_with_flag() = neighbs[__shfl_sync(raft::warp_full_mask(), idx0, 0)];
-  return result;
+  return dist_epilogue(d, document_id, query_id);
 }
 
 template <typename Data_t,
@@ -1434,12 +1367,25 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     s_doc_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES / query_planes * document_planes + DOC_PAD];
   __shared__ __align__(alignof(uint32_t))
     uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES + BBQ_PAD];
-  __shared__ uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
+  // Holds the final (post-metric, post-epilogue) float distance per cell -- computed once, inline,
+  // right when a cell's raw dot product is ready (see the store loops below), instead of the raw
+  // u32 dot product get_min_item_fused used to convert lazily, per read. That removes the need for
+  // get_min_item_fused entirely: both sweeps below read finished floats via the plain
+  // get_min_item, same as the dense/SIMT kernels.
+  __shared__ DistData_t s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
   __shared__ int s_unique_counter[2];
-  // Per-loop cache of the varying list's dequant factors -- see the identical buffer in
-  // local_join_kernel_bbq_wmma for the full rationale (up to 64x redundant scattered global gather
-  // otherwise, since neighbs is constant across a loop's idx_in_list iterations).
-  __shared__ bbq_dequant_factors s_varying_factors[MAX_NUM_BI_SAMPLES];
+  // Document-side (row axis) dequant factors, indexed by list position -- shared by both phases
+  // below since rows are always the `new_neighbors`/document side in both, so this is staged once
+  // and never restaged. At a given accumulation step, up to MAX_NUM_BI_SAMPLES threads share the
+  // same row0 (see the pair_idx assignment below), so caching avoids up to 64x redundant scattered
+  // global reads -- same magnitude problem the old get_min_item_fused design solved with
+  // s_varying_factors, just triggered by the store loop's thread/cell mapping instead of by
+  // repeated min-search reads. The column/query side doesn't need a shared array: pair_idx's
+  // assignment makes `col` invariant across a single thread's own iterations (BLOCK_SIZE is a
+  // multiple of MAX_NUM_BI_SAMPLES), so each thread fetches its own column's factors once,
+  // directly into a register -- only ~8x redundant across the threads sharing that column, not
+  // worth a barrier/array for.
+  __shared__ bbq_dequant_factors s_document_factors[MAX_NUM_BI_SAMPLES];
 
   if (threadIdx.x == 0) {
     s_unique_counter[0] = 0;
@@ -1474,18 +1420,15 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   const int lane_id       = threadIdx.x % raft::warp_size();
   constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
 
-  auto stage_varying_factors = [&](const Index_t* varying_neighbs,
-                                   int varying_size,
-                                   const bbq_device_quantizer_view<DataT, int64_t>& varying_view) {
-    for (int i = tx; i < varying_size; i += BLOCK_SIZE) {
-      const Index_t row                = varying_neighbs[i];
-      s_varying_factors[i].lower       = varying_view.lower_intervals(row);
-      s_varying_factors[i].delta       = varying_view.dequant_delta(row);
-      s_varying_factors[i].sum_delta   = varying_view.dequant_sum_delta(row);
-      s_varying_factors[i].corrections = varying_view.additional_corrections(row);
-    }
-    __syncthreads();
-  };
+  // Rows are always new_neighbors/document in both phases below, so this runs exactly once.
+  for (int i = tx; i < new_size; i += BLOCK_SIZE) {
+    const Index_t row                 = new_neighbors[i];
+    s_document_factors[i].lower       = dataset_document.lower_intervals(row);
+    s_document_factors[i].delta       = dataset_document.dequant_delta(row);
+    s_document_factors[i].sum_delta   = dataset_document.dequant_sum_delta(row);
+    s_document_factors[i].corrections = dataset_document.additional_corrections(row);
+  }
+  __syncthreads();
 
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
@@ -1518,10 +1461,34 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   constexpr int plane_tile_u32       = plane_tile / 4;
   constexpr int query_plane_tile_u32 = query_plane_tile / 4;
   const int n_tiles                  = raft::ceildiv(plane_bytes, plane_tile);
+  // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles row-pair
+  // boundaries. SKEWED is only for the distance matrix layout. Shared by both phases below: thread
+  // tx owns the same pair_idx set on every step of either phase's loop (the assignment doesn't
+  // depend on step), so a per-thread register accumulator can persist across the whole n_tiles
+  // loop and get converted to a final float distance exactly once at the end -- mirroring the wmma
+  // kernel's fragment accumulator, instead of a read-modify-write into SMEM every step.
+  constexpr int num_row_pairs    = MAX_NUM_BI_SAMPLES / 2;
+  constexpr int num_pairs        = num_row_pairs * MAX_NUM_BI_SAMPLES;
+  constexpr int pairs_per_thread = (num_pairs + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances_u32[i] = 0;
+  // Every thread's column is invariant across its pairs_per_thread iterations (BLOCK_SIZE is a
+  // multiple of MAX_NUM_BI_SAMPLES, see s_document_factors' comment above), so fetch it once here
+  // and reuse the register copy in both phases' store loops below instead of a shared array.
+  // row_norm isn't cached here (unlike lower/delta/sum_delta/corrections): it's read fresh from
+  // dataset_query inside bbq_calculate_metric instead -- register pressure is already tight in
+  // this kernel, and row_norm is only needed for the less common CosineExpanded metric.
+  const int my_col = tx % MAX_NUM_BI_SAMPLES;
+  bbq_dequant_factors my_col_factors{};
+  if (my_col < new_size) {
+    const Index_t q_row        = new_neighbors[my_col];
+    my_col_factors.lower       = dataset_query.lower_intervals(q_row);
+    my_col_factors.delta       = dataset_query.dequant_delta(q_row);
+    my_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
+    my_col_factors.corrections = dataset_query.additional_corrections(q_row);
   }
+
+  uint32_t acc0[pairs_per_thread] = {};
+  uint32_t acc1[pairs_per_thread] = {};
   for (int step = 0; step < n_tiles; ++step) {
     const bool last_tile   = (step == n_tiles - 1);
     const int num_load     = last_tile ? plane_bytes - step * plane_tile : plane_tile;
@@ -1561,60 +1528,91 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       __syncthreads();
     }
 
-    // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles
-    // row-pair boundaries. SKEWED is only for the distance matrix layout.
-    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
-    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
+#pragma unroll
+    for (int k = 0; k < pairs_per_thread; ++k) {
+      const int pair_idx = tx + k * BLOCK_SIZE;
+      if (pair_idx >= num_pairs) continue;
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
-      if (col < new_size) {
-        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
-        uint32_t total0     = 0;
-        uint32_t total1     = 0;
-        // Phase 1 B operand: s_doc_vec under SelfJoin (see the staging note above).
-        if constexpr (SelfJoin) {
-          cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                         QueryLayout,
-                                                                         SelfJoin,
-                                                                         document_planes,
-                                                                         query_planes,
-                                                                         doc_row_bytes,
-                                                                         QUERY_ROW_BYTES>(
-            s_doc_vec[row0], s_doc_vec[row0 + 1], s_doc_vec[col], total0, total1);
-        } else {
-          cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                         QueryLayout,
-                                                                         SelfJoin,
-                                                                         document_planes,
-                                                                         query_planes,
-                                                                         doc_row_bytes,
-                                                                         QUERY_ROW_BYTES>(
-            s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
-        }
-        s_distances_u32[distance0] += total0;
-        if (row0 + 1 < new_size) {
-          s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] += total1;
-        }
+      if (col >= new_size) continue;
+      uint32_t total0 = 0;
+      uint32_t total1 = 0;
+      // Phase 1 B operand: s_doc_vec under SelfJoin (see the staging note above).
+      if constexpr (SelfJoin) {
+        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
+                                                                       QueryLayout,
+                                                                       SelfJoin,
+                                                                       document_planes,
+                                                                       query_planes,
+                                                                       doc_row_bytes,
+                                                                       QUERY_ROW_BYTES>(
+          s_doc_vec[row0], s_doc_vec[row0 + 1], s_doc_vec[col], total0, total1);
+      } else {
+        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
+                                                                       QueryLayout,
+                                                                       SelfJoin,
+                                                                       document_planes,
+                                                                       query_planes,
+                                                                       doc_row_bytes,
+                                                                       QUERY_ROW_BYTES>(
+          s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
       }
+      acc0[k] += total0;
+      acc1[k] += total1;
     }
     __syncthreads();
   }
-  stage_varying_factors(new_neighbors, new_size, dataset_query);
+#pragma unroll
+  for (int k = 0; k < pairs_per_thread; ++k) {
+    const int pair_idx = tx + k * BLOCK_SIZE;
+    if (pair_idx >= num_pairs) continue;
+    const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
+    const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
+    if (col >= new_size) continue;
+    const int distance0    = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
+    const Index_t query_id = new_neighbors[col];
+    // row0 (unlike row0 + 1 below) isn't otherwise bounded by new_size -- gate it explicitly so a
+    // stale/garbage new_neighbors[row0] past the real list never reaches a dataset_document lookup
+    // (row_norm, for CosineExpanded); the cell is provably never read downstream either way, since
+    // the min-search loops below only visit idx_in_list < new_size.
+    if (row0 < new_size) {
+      const Index_t doc_id0  = new_neighbors[row0];
+      s_distances[distance0] = bbq_calculate_metric(acc0[k],
+                                                    s_document_factors[row0],
+                                                    my_col_factors,
+                                                    dataset_document,
+                                                    dataset_query,
+                                                    metric,
+                                                    dist_epilogue,
+                                                    doc_id0,
+                                                    query_id);
+    }
+    if (row0 + 1 < new_size) {
+      const Index_t doc_id1 = new_neighbors[row0 + 1];
+      s_distances[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] =
+        bbq_calculate_metric(acc1[k],
+                             s_document_factors[row0 + 1],
+                             my_col_factors,
+                             dataset_document,
+                             dataset_query,
+                             metric,
+                             dist_epilogue,
+                             doc_id1,
+                             query_id);
+    }
+  }
+  __syncthreads();
 
   for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
-                                             idx_in_list,
-                                             new_neighbors,
-                                             new_size,
-                                             s_distances_u32,
-                                             dataset_document,
-                                             dataset_query,
-                                             metric,
-                                             dist_epilogue,
-                                             SKEWED_MAX_NUM_BI_SAMPLES,
-                                             s_varying_factors);
+    auto min_elem = get_min_item(s_list[idx_in_list],
+                                 idx_in_list,
+                                 new_neighbors,
+                                 s_distances,
+                                 true,
+                                 SKEWED_MAX_NUM_BI_SAMPLES,
+                                 new_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -1623,10 +1621,21 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   if (!old_size) return;
   __syncthreads();
 
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances_u32[i] = 0;
+  // Phase 2's column list is old_neighbors, not new_neighbors -- refetch this thread's column
+  // factors (rows/s_document_factors stay valid unchanged, since rows are new_neighbors in both
+  // phases).
+  const int my_old_col = tx % MAX_NUM_BI_SAMPLES;
+  bbq_dequant_factors my_old_col_factors{};
+  if (my_old_col < old_size) {
+    const Index_t q_row            = old_neighbors[my_old_col];
+    my_old_col_factors.lower       = dataset_query.lower_intervals(q_row);
+    my_old_col_factors.delta       = dataset_query.dequant_delta(q_row);
+    my_old_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
+    my_old_col_factors.corrections = dataset_query.additional_corrections(q_row);
   }
 
+  uint32_t acc0_old[pairs_per_thread] = {};
+  uint32_t acc1_old[pairs_per_thread] = {};
   for (int step = 0; step < n_tiles; ++step) {
     const bool last_tile   = (step == n_tiles - 1);
     const int num_load     = last_tile ? plane_bytes - step * plane_tile : plane_tile;
@@ -1659,75 +1668,96 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                              lane_id);
     __syncthreads();
 
-    // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles
-    // row-pair boundaries. SKEWED is only for the distance matrix layout.
-    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
-    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
+#pragma unroll
+    for (int k = 0; k < pairs_per_thread; ++k) {
+      const int pair_idx = tx + k * BLOCK_SIZE;
+      if (pair_idx >= num_pairs) continue;
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
-      if (col < old_size) {
-        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
-        uint32_t total0     = 0;
-        uint32_t total1     = 0;
-        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                       QueryLayout,
-                                                                       SelfJoin,
-                                                                       document_planes,
-                                                                       query_planes,
-                                                                       doc_row_bytes,
-                                                                       QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
-        s_distances_u32[distance0] += total0;
-        if (row0 + 1 < new_size) {
-          s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] += total1;
-        }
-      }
+      if (col >= old_size) continue;
+      uint32_t total0 = 0;
+      uint32_t total1 = 0;
+      cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
+                                                                     QueryLayout,
+                                                                     SelfJoin,
+                                                                     document_planes,
+                                                                     query_planes,
+                                                                     doc_row_bytes,
+                                                                     QUERY_ROW_BYTES>(
+        s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
+      acc0_old[k] += total0;
+      acc1_old[k] += total1;
     }
     __syncthreads();
   }
-
-  stage_varying_factors(old_neighbors, old_size, dataset_query);
+#pragma unroll
+  for (int k = 0; k < pairs_per_thread; ++k) {
+    const int pair_idx = tx + k * BLOCK_SIZE;
+    if (pair_idx >= num_pairs) continue;
+    const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
+    const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
+    if (col >= old_size) continue;
+    const int distance0    = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
+    const Index_t query_id = old_neighbors[col];
+    // See the identical row0 < new_size gate in phase 1 above -- same reasoning (row0 isn't
+    // otherwise bounded, and this cell is never read downstream either way).
+    if (row0 < new_size) {
+      const Index_t doc_id0  = new_neighbors[row0];
+      s_distances[distance0] = bbq_calculate_metric(acc0_old[k],
+                                                    s_document_factors[row0],
+                                                    my_old_col_factors,
+                                                    dataset_document,
+                                                    dataset_query,
+                                                    metric,
+                                                    dist_epilogue,
+                                                    doc_id0,
+                                                    query_id);
+    }
+    if (row0 + 1 < new_size) {
+      const Index_t doc_id1 = new_neighbors[row0 + 1];
+      s_distances[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] =
+        bbq_calculate_metric(acc1_old[k],
+                             s_document_factors[row0 + 1],
+                             my_old_col_factors,
+                             dataset_document,
+                             dataset_query,
+                             metric,
+                             dist_epilogue,
+                             doc_id1,
+                             query_id);
+    }
+  }
+  __syncthreads();
 
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
-                                             idx_in_list,
-                                             old_neighbors,
-                                             old_size,
-                                             s_distances_u32,
-                                             dataset_document,
-                                             dataset_query,
-                                             metric,
-                                             dist_epilogue,
-                                             SKEWED_MAX_NUM_BI_SAMPLES,
-                                             s_varying_factors);
+    auto min_elem = get_min_item(s_list[idx_in_list],
+                                 idx_in_list,
+                                 old_neighbors,
+                                 s_distances,
+                                 true,
+                                 SKEWED_MAX_NUM_BI_SAMPLES,
+                                 old_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
   }
 
-  // loop-old above is the last consumer of s_varying_factors staged for dataset_query -- barrier
-  // before restaging for dataset_document below so no warp is still reading it when it's
-  // overwritten.
-  __syncthreads();
-  stage_varying_factors(new_neighbors, new_size, dataset_document);
-
+  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
+  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
+  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
     const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
-    auto min_elem      = get_min_item_fused<false>(s_list[list_idx],
-                                              idx_in_list,
-                                              new_neighbors,
-                                              new_size,
-                                              s_distances_u32,
-                                              dataset_document,
-                                              dataset_query,
-                                              metric,
-                                              dist_epilogue,
-                                              SKEWED_MAX_NUM_BI_SAMPLES,
-                                              s_varying_factors);
+    auto min_elem      = get_min_item(s_list[list_idx],
+                                 idx_in_list,
+                                 new_neighbors,
+                                 s_distances,
+                                 false,
+                                 SKEWED_MAX_NUM_BI_SAMPLES,
+                                 new_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
@@ -1864,8 +1894,10 @@ __device__ __forceinline__ void stage_promoted_tile(
 // int4 tensor-core BBQ local join, covering both the symmetric (one quantizer, self-join) and
 // asymmetric (two quantizers) cases. Modeled on local_join_kernel_wmma: nvcuda::wmma fragments
 // (u4 x u4 -> s32, shape m8n8k32) replace the popc/dp4a inner product; the accumulator lives in
-// registers across the whole K reduction and is stored to s_distances_u32 once per (row-tile,
-// col-tile), not accumulated into shared memory every step like the scalar kernel.
+// registers across the whole K reduction and is stored to s_distances once per (row-tile,
+// col-tile), not accumulated into shared memory every step like the scalar kernel. That raw store
+// is then converted to final float distances in place -- see run_phase's conversion loop and
+// bbq_calculate_metric.
 //
 // The two cases differ in exactly three places, all compile-time:
 //   * DocumentLayout / QueryLayout -- each operand is promoted to 4-bit width by
@@ -1876,9 +1908,9 @@ __device__ __forceinline__ void stage_promoted_tile(
 //     buffer and feeds it to both fragments, halving that phase's SMEM writes. Asymmetric can
 //     never do this: document and query are two distinct quantized representations of the same
 //     rows, so aliasing them would compute doc.doc, a different (worse) estimator.
-//   * The metric side needs no branch at all -- get_min_item_fused's two-quantizer overloads are
-//     exact generalizations of the single-quantizer ones, so symmetric just passes the same
-//     quantizer and l2_norms twice.
+//   * The metric side needs no branch at all -- bbq_calculate_metric is a single formula that's an
+//     exact generalization of the single-quantizer case, so symmetric just passes the same
+//     quantizer view for both document and query.
 //
 // Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
 // grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
@@ -1968,20 +2000,22 @@ __launch_bounds__(BLOCK_SIZE)
   // SelfJoin, phase 1 leaves s_col_vec untouched and both fragments read s_row_vec.
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
   __shared__ __align__(16) uint8_t s_row_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + MMA_PAD];
-  // s_col_vec aliases s_distances_u32's memory instead of its own array: their live ranges never
+  // s_col_vec aliases s_distances's memory instead of its own array: their live ranges never
   // overlap (col_vec fully consumed by the kk-loop before distances are stored; distances fully
   // consumed by the min-search loop before the next phase re-stages col_vec). Same pattern as
-  // local_join_kernel_wmma's s_distances/s_ov aliasing.
-  __shared__ __align__(16) uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * MMA_STORE_STRIDE];
-  static_assert(sizeof(s_distances_u32) >= MAX_NUM_BI_SAMPLES * (BBQ_ROW_BYTES + MMA_PAD),
-                "s_col_vec aliases s_distances_u32's memory and must fit inside it");
+  // local_join_kernel_wmma's s_distances/s_ov aliasing. store_matrix_sync below writes raw int
+  // accumulator values into this same memory (reinterpreted as int*); the conversion loop right
+  // after it turns those into final DistData_t floats in place -- see bbq_calculate_metric.
+  __shared__ __align__(16) DistData_t s_distances[MAX_NUM_BI_SAMPLES * MMA_STORE_STRIDE];
+  static_assert(sizeof(s_distances) >= MAX_NUM_BI_SAMPLES * (BBQ_ROW_BYTES + MMA_PAD),
+                "s_col_vec aliases s_distances's memory and must fit inside it");
   auto(*s_col_vec)[BBQ_ROW_BYTES + MMA_PAD] =
-    reinterpret_cast<uint8_t(*)[BBQ_ROW_BYTES + MMA_PAD]>(s_distances_u32);
+    reinterpret_cast<uint8_t(*)[BBQ_ROW_BYTES + MMA_PAD]>(s_distances);
   __shared__ int s_unique_counter[2];
-  // Per-loop cache of the varying list's dequant factors (see bbq_dequant_factors), staged once
-  // per loop instead of get_min_item_fused re-fetching the same rows from global on every
-  // idx_in_list iteration. One buffer reused sequentially across the 3 loops.
-  __shared__ bbq_dequant_factors s_varying_factors[MAX_NUM_BI_SAMPLES];
+  // Document-side (row axis) dequant factors -- see the identical buffer and full rationale in
+  // local_join_kernel_bbq_simt. Staged once below, reused unchanged by both phases (rows are
+  // always new_neighbors/document in both).
+  __shared__ bbq_dequant_factors s_document_factors[MAX_NUM_BI_SAMPLES];
 
   if (threadIdx.x == 0) {
     s_unique_counter[0] = 0;
@@ -2029,7 +2063,8 @@ __launch_bounds__(BLOCK_SIZE)
   const int warp_id_x = warp_id % WARPS_PER_DIM;
 
   // One phase: accumulate s_row_vec (rows, `new` list) against col_buf over the whole K range,
-  // then store the accumulators to s_distances_u32. col_buf is s_row_vec itself when phase 1 is a
+  // then store the accumulators to s_distances (converted to final float distances in place right
+  // after). col_buf is s_row_vec itself when phase 1 is a
   // self-join, otherwise s_col_vec. col_neighbors/col_size select which list the B operand stages.
   // alias_tag is an integral_constant, not a bool, so the staging skip and the b_frag source
   // selection below are both compile-time -- no runtime branch inside the kk loop.
@@ -2122,27 +2157,75 @@ __launch_bounds__(BLOCK_SIZE)
         for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
           const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
           wmma::store_matrix_sync(
-            reinterpret_cast<int*>(s_distances_u32) + row0 * MMA_STORE_STRIDE + col0,
+            reinterpret_cast<int*>(s_distances) + row0 * MMA_STORE_STRIDE + col0,
             c_frag[msub][nsub],
             MMA_STORE_STRIDE,
             wmma::mem_row_major);
         }
       }
       __syncthreads();
+
+      // Converts store_matrix_sync's raw int32 dot products into final float distances, in place
+      // -- same idea, and the same bbq_calculate_metric, as local_join_kernel_bbq_simt's store
+      // loop; see its comments for the full rationale. This is a fresh block-strided traversal,
+      // independent of the warp-tile layout above: col = i % MAX_NUM_BI_SAMPLES is invariant
+      // across a thread's own iterations (BLOCK_SIZE is a multiple of MAX_NUM_BI_SAMPLES), so this
+      // thread's column factors are fetched once and reused below, same as s_document_factors'
+      // per-thread column register in local_join_kernel_bbq_simt.
+      // row_norm isn't cached here: it's read fresh from dataset_query inside
+      // bbq_calculate_metric instead, same tradeoff as local_join_kernel_bbq_simt.
+      const int my_col = tx % MAX_NUM_BI_SAMPLES;
+      bbq_dequant_factors my_col_factors{};
+      if (my_col < col_size) {
+        const Index_t q_row        = col_neighbors[my_col];
+        my_col_factors.lower       = dataset_query.lower_intervals(q_row);
+        my_col_factors.delta       = dataset_query.dequant_delta(q_row);
+        my_col_factors.sum_delta   = dataset_query.dequant_sum_delta(q_row);
+        my_col_factors.corrections = dataset_query.additional_corrections(q_row);
+      }
+
+      // Cell (row, col) is read (as raw int, via this alias) and written (as the final float) at
+      // the same address by the same thread, so no cell is ever touched by more than one thread --
+      // no intra-loop synchronization needed, just the barrier below before any thread reads
+      // another thread's cell via get_min_item.
+      auto* raw_view            = reinterpret_cast<int*>(s_distances);
+      constexpr int total_cells = MAX_NUM_BI_SAMPLES * MAX_NUM_BI_SAMPLES;
+      for (int i = tx; i < total_cells; i += BLOCK_SIZE) {
+        const int row = i / MAX_NUM_BI_SAMPLES;
+        const int col = i % MAX_NUM_BI_SAMPLES;
+        // Rows/cols beyond the real list size hold matmul output from garbage-staged
+        // s_row_vec/s_col_vec bytes (see stage_promoted_tile), and are never read downstream
+        // either way (the min-search loops below bound every sweep by the real list size) -- skip
+        // converting them, both to save the work and to avoid a stale new_neighbors[row]/
+        // col_neighbors[col] id reaching a dataset lookup (row_norm, for CosineExpanded).
+        if (row >= new_size || col >= col_size) continue;
+        const int distance0    = row * MMA_STORE_STRIDE + col;
+        const Index_t doc_id   = new_neighbors[row];
+        const Index_t query_id = col_neighbors[col];
+        const uint32_t raw     = static_cast<uint32_t>(raw_view[distance0]);
+        s_distances[distance0] = bbq_calculate_metric(raw,
+                                                      s_document_factors[row],
+                                                      my_col_factors,
+                                                      dataset_document,
+                                                      dataset_query,
+                                                      metric,
+                                                      dist_epilogue,
+                                                      doc_id,
+                                                      query_id);
+      }
+      __syncthreads();
     };
 
-  auto stage_varying_factors = [&](const Index_t* varying_neighbs,
-                                   int varying_size,
-                                   const bbq_device_quantizer_view<DataT, int64_t>& varying_view) {
-    for (int i = tx; i < varying_size; i += BLOCK_SIZE) {
-      const Index_t row                = varying_neighbs[i];
-      s_varying_factors[i].lower       = varying_view.lower_intervals(row);
-      s_varying_factors[i].delta       = varying_view.dequant_delta(row);
-      s_varying_factors[i].sum_delta   = varying_view.dequant_sum_delta(row);
-      s_varying_factors[i].corrections = varying_view.additional_corrections(row);
-    }
-    __syncthreads();
-  };
+  // Rows are always new_neighbors/document in both phases below, so this runs exactly once -- see
+  // the identical staging and rationale in local_join_kernel_bbq_simt.
+  for (int i = tx; i < new_size; i += BLOCK_SIZE) {
+    const Index_t row                 = new_neighbors[i];
+    s_document_factors[i].lower       = dataset_document.lower_intervals(row);
+    s_document_factors[i].delta       = dataset_document.dequant_delta(row);
+    s_document_factors[i].sum_delta   = dataset_document.dequant_sum_delta(row);
+    s_document_factors[i].corrections = dataset_document.additional_corrections(row);
+  }
+  __syncthreads();
 
   // list_idx indexes s_list (which id this row belongs to); idx_in_list is the row's position in
   // the distance matrix. They differ in phase 2's second branch, where the id comes from the
@@ -2150,22 +2233,17 @@ __launch_bounds__(BLOCK_SIZE)
 
   // ---- Phase 1: new x new ----
   run_phase(new_neighbors, new_size, std::integral_constant<bool, SelfJoin>{}, false);
-  stage_varying_factors(new_neighbors, new_size, dataset_query);
 
   for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
-                                             idx_in_list,
-                                             new_neighbors,
-                                             new_size,
-                                             s_distances_u32,
-                                             dataset_document,
-                                             dataset_query,
-                                             metric,
-                                             dist_epilogue,
-                                             MMA_STORE_STRIDE,
-                                             s_varying_factors);
+    auto min_elem = get_min_item(s_list[idx_in_list],
+                                 idx_in_list,
+                                 new_neighbors,
+                                 s_distances,
+                                 true,
+                                 MMA_STORE_STRIDE,
+                                 new_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
@@ -2176,7 +2254,6 @@ __launch_bounds__(BLOCK_SIZE)
 
   // ---- Phase 2: new x old ----
   run_phase(old_neighbors, old_size, std::false_type{}, n_tiles == 1);
-  stage_varying_factors(old_neighbors, old_size, dataset_query);
 
   // Split from one combined [0, 2*MAX_NUM_BI_SAMPLES) loop into two: MAX_NUM_BI_SAMPLES is evenly
   // divisible by num_warps (64/16), so this costs no extra steps, and it turns the old
@@ -2184,43 +2261,27 @@ __launch_bounds__(BLOCK_SIZE)
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused<true>(s_list[idx_in_list],
-                                             idx_in_list,
-                                             old_neighbors,
-                                             old_size,
-                                             s_distances_u32,
-                                             dataset_document,
-                                             dataset_query,
-                                             metric,
-                                             dist_epilogue,
-                                             MMA_STORE_STRIDE,
-                                             s_varying_factors);
+    auto min_elem = get_min_item(s_list[idx_in_list],
+                                 idx_in_list,
+                                 old_neighbors,
+                                 s_distances,
+                                 true,
+                                 MMA_STORE_STRIDE,
+                                 old_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
     }
   }
 
-  // loop2a above is the last consumer of s_varying_factors staged for dataset_query -- barrier
-  // before restaging for dataset_document below so no warp is still reading it when it's
-  // overwritten.
-  __syncthreads();
-  stage_varying_factors(new_neighbors, new_size, dataset_document);
-
+  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
+  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
+  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
     const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
-    auto min_elem      = get_min_item_fused<false>(s_list[list_idx],
-                                              idx_in_list,
-                                              new_neighbors,
-                                              new_size,
-                                              s_distances_u32,
-                                              dataset_document,
-                                              dataset_query,
-                                              metric,
-                                              dist_epilogue,
-                                              MMA_STORE_STRIDE,
-                                              s_varying_factors);
+    auto min_elem      = get_min_item(
+      s_list[list_idx], idx_in_list, new_neighbors, s_distances, false, MMA_STORE_STRIDE, new_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
