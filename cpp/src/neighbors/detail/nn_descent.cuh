@@ -901,73 +901,6 @@ __launch_bounds__(BLOCK_SIZE)
 #endif
 }
 
-// Per-row dequantization terms needed by bbq_calculate_metric. 4 floats = 16 B/row, exactly one
-// vectorized LDS/STS.128 -- row_norm is deliberately excluded (only CosineExpanded needs it) and
-// read directly from the quantizer view instead, since register pressure in the BBQ local-join
-// kernels is already tight.
-struct bbq_dequant_factors {
-  float lower;
-  float delta;
-  float sum_delta;
-  float corrections;
-};
-
-// Converts one raw BBQ dot product into a final (post-epilogue) float distance, given both
-// operands' precomputed dequant factors. Evaluated exactly once per matrix cell, right when a
-// cell's raw total is ready, folded into the single SMEM write that materializes the local-join
-// distance matrix (see local_join_kernel_bbq_simt's store loop and
-// local_join_kernel_bbq_wmma's run_phase conversion loop) -- as opposed to lazily, once per read,
-// which is what an earlier version of this code (get_min_item_fused) paid for phase 2's two sweep
-// directions over the same matrix.
-// dim/centroid_norm_sq/row_norm both come directly from quantizer_document/quantizer_query rather
-// than being passed separately, since every caller reads them the same id-indexed way -- row_norm
-// is only read for CosineExpanded (skipped entirely otherwise). document_id/query_id are also
-// forwarded to dist_epilogue, not used for self-suppression -- callers that need that (i.e. the
-// equivalent of compute_dist's `neighbs[i] == id` check) must do it themselves, or rely on
-// get_min_item's own id-based check at read time when the value being suppressed is never
-// actually read back.
-template <typename DataT, typename Index_t, typename DistEpilogue_t>
-__device__ __forceinline__ float bbq_calculate_metric(
-  uint32_t raw,
-  const bbq_dequant_factors& doc_factors,
-  const bbq_dequant_factors& query_factors,
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_document,
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_query,
-  cuvs::distance::DistanceType metric,
-  DistEpilogue_t dist_epilogue,
-  Index_t document_id,
-  Index_t query_id)
-{
-  constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
-  const float dim = static_cast<float>(quantizer_document.dim());
-  // Symmetric in its two operands, so this is exact regardless of which side is "document" vs.
-  // "query".
-  const float centered = dim * doc_factors.lower * query_factors.lower +
-                         query_factors.lower * doc_factors.sum_delta +
-                         doc_factors.lower * query_factors.sum_delta +
-                         doc_factors.delta * query_factors.delta * static_cast<float>(raw);
-  // Every metric below needs additional_corrections(doc) + additional_corrections(query): L2
-  // directly, InnerProduct/Cosine via the reconstructed original-space dot product.
-  const float corrections = doc_factors.corrections + query_factors.corrections;
-  float d;
-  if (metric == cuvs::distance::DistanceType::L2Expanded ||
-      metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-    const float raw_distance = corrections - 2.0f * centered;
-    d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
-    if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-      d = sqrtf(d);
-    }
-  } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-    d = -(centered + corrections - quantizer_document.centroid_norm_sq);
-  } else {  // CosineExpanded
-    const float norm_product =
-      quantizer_document.row_norm(document_id) * quantizer_query.row_norm(query_id);
-    const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
-    d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
-  }
-  return dist_epilogue(d, document_id, query_id);
-}
-
 template <typename Data_t,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
@@ -1232,6 +1165,60 @@ __launch_bounds__(BLOCK_SIZE)
 // BBQ local-join kernels
 // Quantized-code joins: SIMT (popc / dp4a) and int4 tensor core (u4 wmma).
 // --------------------------------------------------------------------------
+
+// Per-row dequantization terms needed by bbq_calculate_metric.
+// row_norm is read directly from the quantizer view instead,
+// since register pressure in the BBQ local-join kernels is already tight.
+struct bbq_dequant_factors {
+  float lower;
+  float delta;
+  float sum_delta;
+  float corrections;
+};
+
+// Converts one raw BBQ dot product into a final (post-epilogue) float distance, given both
+// operands' precomputed dequant factors. Evaluated exactly once per matrix cell
+// dim/centroid_norm_sq/row_norm both come directly from quantizer_document/quantizer_query rather
+// than being passed separately, since every caller reads them the same id-indexed way -- row_norm
+// is only read for CosineExpanded (skipped entirely otherwise).
+template <typename DataT, typename Index_t, typename DistEpilogue_t>
+__device__ __forceinline__ float bbq_calculate_metric(
+  uint32_t raw,
+  const bbq_dequant_factors& doc_factors,
+  const bbq_dequant_factors& query_factors,
+  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_document,
+  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_query,
+  cuvs::distance::DistanceType metric,
+  DistEpilogue_t dist_epilogue,
+  Index_t document_id,
+  Index_t query_id)
+{
+  constexpr bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+  const float dim                     = static_cast<float>(quantizer_document.dim());
+
+  const float centered = dim * doc_factors.lower * query_factors.lower +
+                         query_factors.lower * doc_factors.sum_delta +
+                         doc_factors.lower * query_factors.sum_delta +
+                         doc_factors.delta * query_factors.delta * static_cast<float>(raw);
+  const float corrections = doc_factors.corrections + query_factors.corrections;
+  float d;
+  if (metric == cuvs::distance::DistanceType::L2Expanded ||
+      metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+    const float raw_distance = corrections - 2.0f * centered;
+    d                        = raw_distance < 0.0f ? 0.0f : raw_distance;
+    if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+      d = sqrtf(d);
+    }
+  } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    d = -(centered + corrections - quantizer_document.centroid_norm_sq);
+  } else {  // CosineExpanded
+    const float norm_product =
+      quantizer_document.row_norm(document_id) * quantizer_query.row_norm(query_id);
+    const float dot = centered + corrections - quantizer_document.centroid_norm_sq;
+    d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+  }
+  return dist_epilogue(d, document_id, query_id);
+}
 
 // Stages one tile of `count` rows into a SIMT shared-memory buffer, zero-padding a short last
 // tile. The SIMT counterpart of stage_promoted_tile: it folds the same warp-strided row loop,
@@ -1908,9 +1895,6 @@ __device__ __forceinline__ void stage_promoted_tile(
 //     buffer and feeds it to both fragments, halving that phase's SMEM writes. Asymmetric can
 //     never do this: document and query are two distinct quantized representations of the same
 //     rows, so aliasing them would compute doc.doc, a different (worse) estimator.
-//   * The metric side needs no branch at all -- bbq_calculate_metric is a single formula that's an
-//     exact generalization of the single-quantizer case, so symmetric just passes the same
-//     quantizer view for both document and query.
 //
 // Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
 // grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
@@ -1926,15 +1910,7 @@ template <bbq_layout DocumentLayout,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
           typename DistEpilogue_t>
-RAFT_KERNEL
-#ifdef __CUDA_ARCH__
-#if (__CUDA_ARCH__) == 700 || (__CUDA_ARCH__) == 800 || (__CUDA_ARCH__) == 900 || \
-  (__CUDA_ARCH__) == 1000
-__launch_bounds__(BLOCK_SIZE, 4)
-#else
-__launch_bounds__(BLOCK_SIZE)
-#endif
-#endif
+RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   local_join_kernel_bbq_wmma(const Index_t* graph_new,
                              const Index_t* rev_graph_new,
                              const int2* sizes_new,
@@ -1951,11 +1927,11 @@ __launch_bounds__(BLOCK_SIZE)
                              cuvs::distance::DistanceType metric,
                              DistEpilogue_t dist_epilogue)
 {
-// int4 sub-byte MMA (nvcuda::wmma experimental::precision::u4) exists from Turing (sm_75) up to
-// and including Hopper (sm_90); Blackwell (sm_100+) dropped it. Guarding both ends here means an
-// unsupported arch fails to find a kernel body at compile time rather than silently building a
-// no-op, so no host-side runtime arch check is needed.
-#if (__CUDA_ARCH__ >= 750 && __CUDA_ARCH__ <= 900)
+// int4 sub-byte MMA (nvcuda::wmma experimental::precision::u4) still compiles on every Blackwell
+// variant (sm_100/103/110/120/121, verified by disassembly): ptxas lowers it to the same software
+// path it's always used since Turing -- unpack each u4 nibble pair into two u8 operands and run
+// two native u8 IMMA instructions, summing the partial products.
+#if (__CUDA_ARCH__ >= 750)
   using namespace nvcuda;
   constexpr int MMA_M = 8;
   constexpr int MMA_N = 8;
@@ -2066,12 +2042,9 @@ __launch_bounds__(BLOCK_SIZE)
   // then store the accumulators to s_distances (converted to final float distances in place right
   // after). col_buf is s_row_vec itself when phase 1 is a
   // self-join, otherwise s_col_vec. col_neighbors/col_size select which list the B operand stages.
-  // alias_tag is an integral_constant, not a bool, so the staging skip and the b_frag source
-  // selection below are both compile-time -- no runtime branch inside the kk loop.
-  // row_resident says the A operand is already staged from a previous phase, which is only true
-  // when the whole row fits one tile (n_tiles == 1) so nothing overwrote it. Mirrors the SIMT
-  // kernel's `if (n_tiles > 1)` restage guard. Dormant at dim=1024 (n_tiles == 4); it fires from
-  // dim <= 256, where promoted_row_bytes <= BBQ_ROW_BYTES.
+  // alias_tag: staging skip and b_frag source
+  // row_resident: the A operand is already staged from a previous phase, which is only true
+  // when the whole row fits one tile (n_tiles == 1) so nothing overwrote it.
   auto run_phase =
     [&](const Index_t* col_neighbors, int col_size, auto alias_tag, bool row_resident) {
       constexpr bool alias_col = decltype(alias_tag)::value;
@@ -2166,14 +2139,9 @@ __launch_bounds__(BLOCK_SIZE)
       __syncthreads();
 
       // Converts store_matrix_sync's raw int32 dot products into final float distances, in place
-      // -- same idea, and the same bbq_calculate_metric, as local_join_kernel_bbq_simt's store
-      // loop; see its comments for the full rationale. This is a fresh block-strided traversal,
-      // independent of the warp-tile layout above: col = i % MAX_NUM_BI_SAMPLES is invariant
-      // across a thread's own iterations (BLOCK_SIZE is a multiple of MAX_NUM_BI_SAMPLES), so this
-      // thread's column factors are fetched once and reused below, same as s_document_factors'
-      // per-thread column register in local_join_kernel_bbq_simt.
-      // row_norm isn't cached here: it's read fresh from dataset_query inside
-      // bbq_calculate_metric instead, same tradeoff as local_join_kernel_bbq_simt.
+      // col = i % MAX_NUM_BI_SAMPLES is invariant across a thread's own iterations
+      // (BLOCK_SIZE is a multiple of MAX_NUM_BI_SAMPLES), so this thread's column factors are
+      // fetched once and reused below
       const int my_col = tx % MAX_NUM_BI_SAMPLES;
       bbq_dequant_factors my_col_factors{};
       if (my_col < col_size) {
@@ -2193,11 +2161,6 @@ __launch_bounds__(BLOCK_SIZE)
       for (int i = tx; i < total_cells; i += BLOCK_SIZE) {
         const int row = i / MAX_NUM_BI_SAMPLES;
         const int col = i % MAX_NUM_BI_SAMPLES;
-        // Rows/cols beyond the real list size hold matmul output from garbage-staged
-        // s_row_vec/s_col_vec bytes (see stage_promoted_tile), and are never read downstream
-        // either way (the min-search loops below bound every sweep by the real list size) -- skip
-        // converting them, both to save the work and to avoid a stale new_neighbors[row]/
-        // col_neighbors[col] id reaching a dataset lookup (row_norm, for CosineExpanded).
         if (row >= new_size || col >= col_size) continue;
         const int distance0    = row * MMA_STORE_STRIDE + col;
         const Index_t doc_id   = new_neighbors[row];
@@ -2286,7 +2249,7 @@ __launch_bounds__(BLOCK_SIZE)
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
     }
   }
-#endif  // 750 <= __CUDA_ARCH__ <= 900
+#endif  // (__CUDA_ARCH__ >= 750)
 }
 
 // launch_bounds here denote BLOCK_SIZE = 512 and MIN_BLOCKS_PER_SM = 4
