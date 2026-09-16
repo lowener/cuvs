@@ -34,7 +34,6 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
     case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
     case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
     case bbq_code_layout::packed_4b: return (dim + 1) / 2;
-    case bbq_code_layout::packed_2b: return (dim + 3) / 4;
     case bbq_code_layout::transposed_4b: return 4 * ((dim + 7) / 8);
     case bbq_code_layout::packed_7b: return dim;
     case bbq_code_layout::packed_8b: return dim;

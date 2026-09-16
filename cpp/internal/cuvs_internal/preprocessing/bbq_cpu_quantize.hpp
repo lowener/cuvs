@@ -177,7 +177,6 @@ inline size_t encoded_row_length(size_t dim, uint32_t bits, bbq_code_layout layo
   switch (layout) {
     case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
     case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
-    case bbq_code_layout::packed_2b: return (dim + 3) / 4;
     case bbq_code_layout::packed_4b: return (dim + 1) / 2;
     case bbq_code_layout::packed_7b: return dim;
     case bbq_code_layout::packed_8b: return dim;
@@ -186,7 +185,7 @@ inline size_t encoded_row_length(size_t dim, uint32_t bits, bbq_code_layout layo
   return 0;
 }
 
-// Packs one-byte-per-component codes into packed_1b / packed_2b / transposed_2b /
+// Packs one-byte-per-component codes into packed_1b / transposed_2b /
 // packed_4b / transposed_4b (or leaves unpacked). Matches Lucene packAsBinary,
 // packNibbles, transposeDibit, transposeHalfByte.
 inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
@@ -208,22 +207,12 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
     if (layout == bbq_code_layout::packed_4b) {
       // Contiguous: dims 2k / 2k+1 share byte k. NOT Lucene packNibbles, which pairs dim i with
       // dim dim/2 + i. A self-join is position-agnostic so either works there, but an asymmetric
-      // pair (packed_1b or packed_2b document promoted to 4-bit width against this query) needs
-      // dimension k of both operands in the same slot -- halves-pairing silently multiplies
-      // mismatched dimensions and costs recall.
+      // pair (packed_1b or transposed_2b document promoted to 4-bit width against this query)
+      // needs dimension k of both operands in the same slot -- halves-pairing silently
+      // multiplies mismatched dimensions and costs recall.
       const size_t pairs = dim / 2;
       for (size_t i = 0; i < pairs; ++i) {
         output[i] = static_cast<uint8_t>((input[2 * i] << 4) | (input[2 * i + 1] & 0x0f));
-      }
-      continue;
-    }
-    if (layout == bbq_code_layout::packed_2b) {
-      // Dense 2-bit: four consecutive dimensions per byte, most significant
-      // first. Not a bit-plane layout, so it must not fall through below.
-      const size_t quads = dim / 4;
-      for (size_t i = 0; i < quads; ++i) {
-        output[i] = static_cast<uint8_t>((input[4 * i] << 6) | (input[4 * i + 1] << 4) |
-                                         (input[4 * i + 2] << 2) | input[4 * i + 3]);
       }
       continue;
     }
@@ -425,12 +414,13 @@ struct bbq_layout_token {
 };
 
 // Same convention as my_tests/bbq's CLI tokens: bare N = densely packed (tensor-core-eligible),
-// N + "t" = transposed/bitplane (SIMT). At 1 bit the two coincide, so there is no "1t".
+// N + "t" = transposed/bitplane (SIMT). At 1 bit the two coincide, so there is no "1t". There is
+// no densely-packed 2-bit layout at all (packed_2b was retired): transposed_2b is SIMT-only, so
+// "2" is the only 2-bit token and it is not tensor-core-eligible.
 constexpr bbq_layout_token kBbqLayoutTokens[] = {
   {"1", 1, bbq_code_layout::packed_1b},
-  {"2", 2, bbq_code_layout::packed_2b},
-  {"4", 4, bbq_code_layout::packed_4b},
   {"2t", 2, bbq_code_layout::transposed_2b},
+  {"4", 4, bbq_code_layout::packed_4b},
   {"4t", 4, bbq_code_layout::transposed_4b},
   {"7", 7, bbq_code_layout::packed_7b},
   {"8", 8, bbq_code_layout::packed_8b},
@@ -443,7 +433,7 @@ inline auto parse_bbq_layout_token(std::string_view token) -> std::pair<uint32_t
   for (const auto& t : kBbqLayoutTokens) {
     if (t.token == token) { return {t.bits, t.layout}; }
   }
-  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2, 4, 2t, 4t, 7, 8.",
+  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2t, 4, 4t, 7, 8.",
             std::string(token).c_str());
 }
 
@@ -462,22 +452,21 @@ inline void validate_layout_pair(bbq_code_layout query_layout, bbq_code_layout d
                            query_layout == bbq_code_layout::packed_7b ||
                            query_layout == bbq_code_layout::packed_8b;
     RAFT_EXPECTS(supported,
-                 "Symmetric BBQ NN-Descent has no local-join kernel for layout %d -- packed_2b "
-                 "and transposed_4b are only supported as one side of an asymmetric pair.",
+                 "Symmetric BBQ NN-Descent has no local-join kernel for layout %d -- "
+                 "transposed_4b is only supported as one side of an asymmetric pair.",
                  static_cast<int>(query_layout));
     return;
   }
   const bool supported =
     (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::packed_4b) ||
-    (doc_layout == bbq_code_layout::packed_2b && query_layout == bbq_code_layout::packed_4b) ||
     (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_2b) ||
     (doc_layout == bbq_code_layout::packed_1b && query_layout == bbq_code_layout::transposed_4b) ||
     (doc_layout == bbq_code_layout::transposed_2b &&
      query_layout == bbq_code_layout::transposed_4b);
   RAFT_EXPECTS(supported,
                "Asymmetric BBQ NN-Descent supports only (doc, query) layouts of (packed_1b, "
-               "packed_4b), (packed_2b, packed_4b), (packed_1b, transposed_2b), (packed_1b, "
-               "transposed_4b), or (transposed_2b, transposed_4b); got (%d, %d).",
+               "packed_4b), (packed_1b, transposed_2b), (packed_1b, transposed_4b), or "
+               "(transposed_2b, transposed_4b); got (%d, %d).",
                static_cast<int>(doc_layout),
                static_cast<int>(query_layout));
 }
