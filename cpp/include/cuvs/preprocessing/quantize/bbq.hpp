@@ -37,8 +37,9 @@ enum class bbq_code_layout {
                   * OptimizedScalarQuantizer.packAsBinary. During query time, the query vector is
                   * quantized to 4 bits per dimension. */
   transposed_2b, /** Each dimension is quantized to 2 bits, stored as 2 bitplanes.
-                  * Reflects OptimizedScalarQuantizer.transposeDibit. During query time, the query
-                  * vector is quantized to 4 bits per dimension. */
+                  * Reflects OptimizedScalarQuantizer.transposeDibit. SIMT popc path only (paired
+                  * with a transposed_4b or packed_1b operand); there is no densely-packed 2-bit
+                  * layout, so 2-bit codes never reach the int4 tensor-core path. */
   transposed_4b, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
                   * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
                   * every dimension is in the first set dimensions bits, or (dimensions/8)
@@ -46,12 +47,6 @@ enum class bbq_code_layout {
                   * fourth set of dimensions bits, respectively. Format used for queries. */
   packed_4b,     /** Each dimension is quantized to 4 bits, two values are packed into each output
                   * byte. Reflects OffHeapScalarQuantizedVectorValues.packNibbles. */
-  packed_2b,     /** Each dimension is quantized to 2 bits, four values (from consecutive
-                  * dimensions) are packed into each output byte -- the 2-bit analogue of
-                  * packed_4b's contiguous packing. Densely stored (4x smaller than storing
-                  * the same 2-bit codes in packed_4b's 4-bit-width slots); a bits=2
-                  * document in this layout must be promoted to 4-bit width before an int4 MMA
-                  * against a packed_4b query. */
   packed_7b,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
   packed_8b,     /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
 
@@ -136,7 +131,6 @@ struct bbq_quantizer {
       case bbq_code_layout::packed_1b: return (d * bits + 7) / 8;
       case bbq_code_layout::transposed_2b: return bits * ((d + 7) / 8);
       case bbq_code_layout::packed_4b: return (d + 1) / 2;
-      case bbq_code_layout::packed_2b: return (d + 3) / 4;
       case bbq_code_layout::packed_7b: return d;
       case bbq_code_layout::packed_8b: return d;
       case bbq_code_layout::transposed_4b: return 4 * ((d + 7) / 8);

@@ -61,7 +61,6 @@ constexpr uint8_t bits_of(cuvs::preprocessing::quantize::bbq::bbq_code_layout la
 {
   switch (layout) {
     case cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_1b: return 1;
-    case cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_2b:
     case cuvs::preprocessing::quantize::bbq::bbq_code_layout::transposed_2b: return 2;
     case cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_4b:
     case cuvs::preprocessing::quantize::bbq::bbq_code_layout::transposed_4b: return 4;
@@ -241,16 +240,14 @@ const std::vector<AnnNNDescentBbqInputs> bbq_inputs = [] {
        bbq_code_layout::transposed_2b,
        std::optional<bbq_code_layout>{bbq_code_layout::packed_1b}},
       {4, 0.80, bbq_code_layout::packed_4b, std::optional<bbq_code_layout>{}},
-      // Asymmetric packed_4b queries take the int4 wmma path (SelfJoin = false). At dim=256 these
-      // are also the only coverage of the phase-2 staging skip (n_tiles == 1) outside a self-join.
+      // Asymmetric packed_4b queries take the int4 wmma path (SelfJoin = false). packed_1b is the
+      // only document layout that promotes to it -- transposed_2b never reaches this kernel. At
+      // dim=256 this is also the only coverage of the phase-2 staging skip (n_tiles == 1) outside
+      // a self-join.
       {4,
        0.35,
        bbq_code_layout::packed_4b,
        std::optional<bbq_code_layout>{bbq_code_layout::packed_1b}},
-      {4,
-       0.65,
-       bbq_code_layout::packed_4b,
-       std::optional<bbq_code_layout>{bbq_code_layout::packed_2b}},
       // Asymmetric transposed_4b queries (1 + 4t, 2t + 4t) take the SIMT path.
       {4,
        0.35,

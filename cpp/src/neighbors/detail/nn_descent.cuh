@@ -1751,36 +1751,12 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   }
 }
 
-// Promotes one native word of dense packed_2b codes (2 bits/value, 4 values/byte; byte k =
-// (v[4k]<<6)|(v[4k+1]<<4)|(v[4k+2]<<2)|v[4k+3]) into two 4-bit-width, packed_4b-style
-// output words, so the result can feed a u4 MMA fragment directly. native_word's byte i (LSB
-// first, i.e. lowest address) becomes output bytes 2i and 2i+1 of (out_lo, out_hi).
-//
-// Branch-free SWAR: each byte's top/bottom nibble (v0v1 / v2v3, 2 bits each) is "spread" into a
-// full nibble-per-value byte lane-wise across all 4 bytes at once (spread(x) turns a nibble
-// v_hi:v_lo into a byte (v_hi<<4)|v_lo -- exact for the 2-bit range used here), then the two
-// spread words are interleaved into the final byte order with __byte_perm. Equivalence with the
-// straightforward per-byte-extraction version verified exhaustively over random 32-bit inputs.
-__device__ __forceinline__ void promote_packed_2b_word_to_4b(uint32_t native_word,
-                                                             uint32_t& out_lo,
-                                                             uint32_t& out_hi)
-{
-  const uint32_t tn_word = (native_word >> 4) & 0x0F0F0F0Fu;  // byte i = (v0<<2)|v1
-  const uint32_t bn_word = native_word & 0x0F0F0F0Fu;         // byte i = (v2<<2)|v3
-  const auto spread      = [](uint32_t w) { return ((w & 0x0C0C0C0Cu) << 2) | (w & 0x03030303u); };
-  const uint32_t spread_tn = spread(tn_word);                            // byte i = (v0<<4)|v1
-  const uint32_t spread_bn = spread(bn_word);                            // byte i = (v2<<4)|v3
-  out_lo                   = __byte_perm(spread_tn, spread_bn, 0x5140);  // [TN0,BN0,TN1,BN1]
-  out_hi                   = __byte_perm(spread_tn, spread_bn, 0x7362);  // [TN2,BN2,TN3,BN3]
-}
-
 // Promotes one native word of dense packed_1b codes (1 bit/value, 8 values/byte, MSB-first:
 // the value at position 8*byte+i sits at bit (7-i)) into four 4-bit-width, packed_4b-style
 // output words.
 //
 // Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise across all 4 native
-// bytes at once (field[j]'s byte i = field j of native byte i -- same cross-lane-safe
-// shift+mask trick as promote_packed_2b_word_to_4b), spread each field 0-3 into a
+// bytes at once (field[j]'s byte i = field j of native byte i), spread each field 0-3 into a
 // nibble value lane-wise, then transpose the 4 resulting field-words into the 4 per-native-byte
 // output words with chained __byte_perm pairs (16 bits at a time, since one __byte_perm call
 // only reaches 2 of the 4 field-words). Equivalence with the straightforward
@@ -1810,8 +1786,6 @@ __device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_
 {
   if constexpr (Layout == bbq_layout::packed_1b) {
     promote_packed_1b_word_to_4b(native_word, out);
-  } else if constexpr (Layout == bbq_layout::packed_2b) {
-    promote_packed_2b_word_to_4b(native_word, out[0], out[1]);
   } else {
     out[0] = native_word;  // packed_4b: already 4-bit-width
   }
@@ -1835,16 +1809,13 @@ __device__ __forceinline__ void stage_promoted_tile(
   const int warp_id,
   const int lane_id)
 {
-  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_2b ||
-                  Layout == bbq_layout::packed_4b,
-                "int4 MMA path supports packed_1b (1b), packed_2b (2b), packed_4b (4b)");
+  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
+                "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
   // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
   // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
   // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
-  // promoted *query* (1+2, 2+2) works exactly like a promoted document.
-  constexpr int expansion       = Layout == bbq_layout::packed_1b   ? 4
-                                  : Layout == bbq_layout::packed_2b ? 2
-                                                                    : 1;
+  // promoted query works exactly like a promoted document.
+  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
   constexpr int native_tile     = TileBytes / expansion;
   constexpr int native_tile_u32 = native_tile / 4;
   constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
@@ -1889,8 +1860,8 @@ __device__ __forceinline__ void stage_promoted_tile(
 // The two cases differ in exactly three places, all compile-time:
 //   * DocumentLayout / QueryLayout -- each operand is promoted to 4-bit width by
 //     stage_promoted_tile, and packed_4b is the identity case, so "no promotion" is not a
-//     separate code path. Any promotable pair works (4x4, 2x4, 1x4, and 1+2 / 2+2 / 1+1 by
-//     dispatch alone).
+//     separate code path. packed_1b is the only promotable document layout (4x4, 1x4 by dispatch
+//     alone); transposed_2b never reaches this kernel.
 //   * SelfJoin -- when both operands are the same quantizer, phase 1 (new x new) stages one
 //     buffer and feeds it to both fragments, halving that phase's SMEM writes. Asymmetric can
 //     never do this: document and query are two distinct quantized representations of the same
@@ -2655,28 +2626,27 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
   // SelfJoin encodes. Picking the two quantizers is all that differs.
   const bool self_join = dataset.quantizers.size() == 1;
   const bool has_1b    = dataset.has_bit_and_layout(1, L::packed_1b);
-  const bool has_2b    = dataset.has_bit_and_layout(2, L::packed_2b);
   const bool has_4b    = dataset.has_bit_and_layout(4, L::packed_4b);
   const bool has_2bt   = dataset.has_bit_and_layout(2, L::transposed_2b);
   const bool has_4bt   = dataset.has_bit_and_layout(4, L::transposed_4b);
 
   // Asymmetric: a packed_4b query selects the tensor-core path, a transposed query the SIMT one.
-  const bool tc_pair   = has_4b && (has_2b || has_1b);
+  // Only packed_1b promotes to the tensor-core path; transposed_2b is SIMT-only (it would need
+  // promoting from two bitplanes at once, which the int4 MMA staging doesn't support).
+  const bool tc_pair   = has_4b && has_1b;
   const bool simt_pair = (has_4bt && (has_1b || has_2bt)) || (has_2bt && has_1b);
   RAFT_EXPECTS(self_join || tc_pair || simt_pair,
                "Unsupported BBQ layout pair for asymmetric local join. Supported: "
-               "packed_2b/packed_1b x packed_4b (tensor core); packed_1b x transposed_2b, "
+               "packed_1b x packed_4b (tensor core); packed_1b x transposed_2b, "
                "packed_1b x transposed_4b, transposed_2b x transposed_4b (SIMT).");
   auto quantizer_query    = self_join
                               ? dataset.quantizers[0]
                               : (tc_pair ? dataset.get_quantizer(4, L::packed_4b)
                                          : (has_4bt ? dataset.get_quantizer(4, L::transposed_4b)
                                                     : dataset.get_quantizer(2, L::transposed_2b)));
-  auto quantizer_document = self_join
-                              ? dataset.quantizers[0]
-                              : (has_1b ? dataset.get_quantizer(1, L::packed_1b)
-                                        : (tc_pair ? dataset.get_quantizer(2, L::packed_2b)
-                                                   : dataset.get_quantizer(2, L::transposed_2b)));
+  auto quantizer_document = self_join ? dataset.quantizers[0]
+                            : has_1b  ? dataset.get_quantizer(1, L::packed_1b)
+                                      : dataset.get_quantizer(2, L::transposed_2b);
 
   // load_vec_bbq_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
   // must be 4-byte aligned.
@@ -2749,10 +2719,6 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     }
   } else if (d == L::packed_1b && q == L::packed_4b) {
     launch(std::integral_constant<L, L::packed_1b>{},
-           std::integral_constant<L, L::packed_4b>{},
-           std::false_type{});
-  } else if (d == L::packed_2b && q == L::packed_4b) {
-    launch(std::integral_constant<L, L::packed_2b>{},
            std::integral_constant<L, L::packed_4b>{},
            std::false_type{});
   } else if (d == L::packed_1b && q == L::transposed_2b) {
