@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -65,14 +66,10 @@ struct bbq_quantizer {
   dense_owning_vector<DataT, IdxT, Accessor> centroid;
   // Precomputed per-row dequantization factors, derived once (offline) from lower/upper_intervals
   // and quantized_component_sums: dequant_delta = (upper-lower)/(2^bits-1), dequant_sum_delta =
-  // dequant_delta * quantized_component_sums. centered_dot() reads these directly instead of
-  // re-deriving them (division, subtraction, int->float cast) on every call.
+  // dequant_delta * quantized_component_sums.
   dense_owning_vector<float, IdxT, Accessor> dequant_delta;
   dense_owning_vector<float, IdxT, Accessor> dequant_sum_delta;
-  // Squared norm of the row in original (un-centered) vector space, ||x||^2 -- precomputed once
-  // (offline) since it's a function of the raw input, not derivable from the other stored
-  // per-row scalars. Used by CosineExpanded, previously recomputed on-device every NN-descent
-  // local-join call via row_norm()/bbq_row_norm_op; now just a per-row lookup.
+  // Squared norm of the row in original (un-centered) vector space, ||x||^2
   dense_owning_vector<float, IdxT, Accessor> row_norm;
 
   uint32_t bits{};
@@ -80,14 +77,64 @@ struct bbq_quantizer {
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
+  /** Returns @p provided as-is if given, else derives dequant_delta from lower/upper_intervals
+   *  and bits. Only reachable for host-accessible storage -- see the field comment above. */
+  static auto resolve_dequant_delta(
+    std::optional<dense_owning_vector<float, IdxT, Accessor>>&& provided,
+    const dense_owning_vector<float, IdxT, Accessor>& lower_intervals,
+    const dense_owning_vector<float, IdxT, Accessor>& upper_intervals,
+    uint32_t bits) -> dense_owning_vector<float, IdxT, Accessor>
+  {
+    if (provided.has_value()) { return std::move(*provided); }
+    if constexpr (Accessor::is_device_accessible) {
+      RAFT_FAIL(
+        "BBQ device quantizers must supply dequant_delta explicitly; deriving it here would "
+        "require a raft::resources stream to allocate device memory, which this constructor "
+        "doesn't have.");
+    } else {
+      const auto n_rows = lower_intervals.extent(0);
+      auto out          = raft::make_host_vector<float, IdxT>(n_rows);
+      const float scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
+      for (IdxT i = 0; i < n_rows; ++i) {
+        out(i) = (upper_intervals(i) - lower_intervals(i)) * scale;
+      }
+      return out;
+    }
+  }
+
+  /** Returns @p provided as-is if given, else derives dequant_sum_delta from the (already
+   *  resolved) dequant_delta and quantized_component_sums. Host-accessible storage only, same as
+   *  resolve_dequant_delta. */
+  static auto resolve_dequant_sum_delta(
+    std::optional<dense_owning_vector<float, IdxT, Accessor>>&& provided,
+    const dense_owning_vector<float, IdxT, Accessor>& dequant_delta,
+    const dense_owning_vector<int32_t, IdxT, Accessor>& quantized_component_sums)
+    -> dense_owning_vector<float, IdxT, Accessor>
+  {
+    if (provided.has_value()) { return std::move(*provided); }
+    if constexpr (Accessor::is_device_accessible) {
+      RAFT_FAIL(
+        "BBQ device quantizers must supply dequant_sum_delta explicitly; deriving it here would "
+        "require a raft::resources stream to allocate device memory, which this constructor "
+        "doesn't have.");
+    } else {
+      const auto n_rows = dequant_delta.extent(0);
+      auto out          = raft::make_host_vector<float, IdxT>(n_rows);
+      for (IdxT i = 0; i < n_rows; ++i) {
+        out(i) = dequant_delta(i) * static_cast<float>(quantized_component_sums(i));
+      }
+      return out;
+    }
+  }
+
   bbq_quantizer(dense_owning_matrix<uint8_t, IdxT, Accessor>&& codes,
                 dense_owning_vector<float, IdxT, Accessor>&& lower_intervals,
                 dense_owning_vector<float, IdxT, Accessor>&& upper_intervals,
                 dense_owning_vector<float, IdxT, Accessor>&& additional_corrections,
                 dense_owning_vector<int32_t, IdxT, Accessor>&& quantized_component_sums,
                 dense_owning_vector<DataT, IdxT, Accessor>&& centroid,
-                dense_owning_vector<float, IdxT, Accessor>&& dequant_delta,
-                dense_owning_vector<float, IdxT, Accessor>&& dequant_sum_delta,
+                std::optional<dense_owning_vector<float, IdxT, Accessor>>&& dequant_delta,
+                std::optional<dense_owning_vector<float, IdxT, Accessor>>&& dequant_sum_delta,
                 dense_owning_vector<float, IdxT, Accessor>&& row_norm,
                 uint32_t bits,
                 bbq_code_layout layout,
@@ -99,8 +146,10 @@ struct bbq_quantizer {
       additional_corrections{std::move(additional_corrections)},
       quantized_component_sums{std::move(quantized_component_sums)},
       centroid{std::move(centroid)},
-      dequant_delta{std::move(dequant_delta)},
-      dequant_sum_delta{std::move(dequant_sum_delta)},
+      dequant_delta{resolve_dequant_delta(
+        std::move(dequant_delta), this->lower_intervals, this->upper_intervals, bits)},
+      dequant_sum_delta{resolve_dequant_sum_delta(
+        std::move(dequant_sum_delta), this->dequant_delta, this->quantized_component_sums)},
       row_norm{std::move(row_norm)},
       bits{bits},
       layout{layout},
@@ -114,8 +163,8 @@ struct bbq_quantizer {
     RAFT_EXPECTS(lower_intervals.extent(0) == n_rows && upper_intervals.extent(0) == n_rows &&
                    additional_corrections.extent(0) == n_rows &&
                    quantized_component_sums.extent(0) == n_rows &&
-                   dequant_delta.extent(0) == n_rows && dequant_sum_delta.extent(0) == n_rows &&
-                   row_norm.extent(0) == n_rows,
+                   this->dequant_delta.extent(0) == n_rows &&
+                   this->dequant_sum_delta.extent(0) == n_rows && row_norm.extent(0) == n_rows,
                  "Every BBQ correction array must contain one value per row.");
   }
 
