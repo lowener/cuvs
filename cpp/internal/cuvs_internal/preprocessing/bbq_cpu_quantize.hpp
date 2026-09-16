@@ -264,14 +264,6 @@ inline host_storage quantize(const float* data,
   auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
   auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
   auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
-  // Per-row dequantization factors, derived here (offline, once) so centered_dot() on the device
-  // never has to re-derive them from lower/upper_intervals and quantized_component_sums.
-  auto dequant_delta        = raft::make_host_vector<float, int64_t>(n_rows);
-  auto dequant_sum_delta    = raft::make_host_vector<float, int64_t>(n_rows);
-  const float dequant_scale = 1.0f / static_cast<float>((uint32_t{1} << bits) - 1);
-  // Squared norm of the row in original (pre-centering) space -- needed by CosineExpanded, not
-  // derivable from `additional_corrections` (that's the centered/residual norm for the euclidean
-  // metric, or a centroid dot product otherwise), so computed here directly from `data`.
   auto row_norm = raft::make_host_vector<float, int64_t>(n_rows);
 
 #pragma omp parallel for
@@ -289,9 +281,6 @@ inline host_storage quantize(const float* data,
     upper_intervals(i)          = result.upper_interval;
     additional_corrections(i)   = result.additional_correction;
     quantized_component_sums(i) = result.quantized_component_sum;
-    const float delta           = (result.upper_interval - result.lower_interval) * dequant_scale;
-    dequant_delta(i)            = delta;
-    dequant_sum_delta(i)        = delta * static_cast<float>(result.quantized_component_sum);
   }
 
   auto packed =
@@ -306,8 +295,8 @@ inline host_storage quantize(const float* data,
                       std::move(additional_corrections),
                       std::move(quantized_component_sums),
                       std::move(centroid),
-                      std::move(dequant_delta),
-                      std::move(dequant_sum_delta),
+                      std::nullopt,  // dequant_delta: derived by the constructor
+                      std::nullopt,  // dequant_sum_delta: derived by the constructor
                       std::move(row_norm),
                       static_cast<uint32_t>(bits),
                       layout,
