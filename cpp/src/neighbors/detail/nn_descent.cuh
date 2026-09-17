@@ -1316,13 +1316,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   // below since rows are always the `new_neighbors`/document side in both, so this is staged once
   // and never restaged. At a given accumulation step, up to MAX_NUM_BI_SAMPLES threads share the
   // same row0 (see the pair_idx assignment below), so caching avoids up to 64x redundant scattered
-  // global reads -- same magnitude problem the old get_min_item_fused design solved with
-  // s_varying_factors, just triggered by the store loop's thread/cell mapping instead of by
-  // repeated min-search reads. The column/query side doesn't need a shared array: pair_idx's
-  // assignment makes `col` invariant across a single thread's own iterations (BLOCK_SIZE is a
-  // multiple of MAX_NUM_BI_SAMPLES), so each thread fetches its own column's factors once,
-  // directly into a register -- only ~8x redundant across the threads sharing that column, not
-  // worth a barrier/array for.
+  // global reads
   __shared__ bbq_dequant_factors s_document_factors[MAX_NUM_BI_SAMPLES];
 
   if (threadIdx.x == 0) {
@@ -1395,22 +1389,14 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   constexpr int plane_tile_u32       = plane_tile / 4;
   constexpr int query_plane_tile_u32 = query_plane_tile / 4;
   const int n_tiles                  = raft::ceildiv(plane_bytes, plane_tile);
-  // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles row-pair
-  // boundaries. SKEWED is only for the distance matrix layout. Shared by both phases below: thread
-  // tx owns the same pair_idx set on every step of either phase's loop (the assignment doesn't
-  // depend on step), so a per-thread register accumulator can persist across the whole n_tiles
-  // loop and get converted to a final float distance exactly once at the end -- mirroring the wmma
-  // kernel's fragment accumulator, instead of a read-modify-write into SMEM every step.
+
+  // with NUM_SAMPLES=32, BLOCK_SIZE=256, pairs_per_thread = 32 * 64 / 512 = 4
   constexpr int num_row_pairs    = MAX_NUM_BI_SAMPLES / 2;
   constexpr int num_pairs        = num_row_pairs * MAX_NUM_BI_SAMPLES;
   constexpr int pairs_per_thread = (num_pairs + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-  // Every thread's column is invariant across its pairs_per_thread iterations (BLOCK_SIZE is a
-  // multiple of MAX_NUM_BI_SAMPLES, see s_document_factors' comment above), so fetch it once here
-  // and reuse the register copy in both phases' store loops below instead of a shared array.
-  // row_norm isn't cached here (unlike lower/delta/sum_delta/corrections): it's read fresh from
-  // dataset_query inside bbq_calculate_metric instead -- register pressure is already tight in
-  // this kernel, and row_norm is only needed for the less common CosineExpanded metric.
+  // Every thread's column is invariant across its pairs_per_thread iterations, so fetch it once
+  // here and reuse the register copy in both phases' store loops below instead of a shared array.
   const int my_col = tx % MAX_NUM_BI_SAMPLES;
   bbq_dequant_factors my_col_factors{};
   if (my_col < new_size) {
@@ -1435,14 +1421,12 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                               last_tile,
                                                               warp_id,
                                                               lane_id);
-    __syncthreads();
 
     // Query and document tiles cover the same dimension range per step (both tile at
     // query_plane_tile), so load the query tile once and run the dot product directly -- no
     // per-step query sub-tile loop. Under SelfJoin phase 1 is new x new on a single quantizer,
     // so the document buffer already holds exactly what the query buffer would: skip the load
-    // and point the B operand at s_doc_vec. This is the SIMT twin of the wmma kernel's phase-1
-    // buffer alias, and halves this phase's staging traffic.
+    // and point the B operand at s_doc_vec.
     if constexpr (!SelfJoin) {
       stage_tile_simt<query_planes, QUERY_ROW_BYTES + BBQ_PAD>(s_query_vec,
                                                                dataset_query,
@@ -1455,8 +1439,8 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                                last_tile,
                                                                warp_id,
                                                                lane_id);
-      __syncthreads();
     }
+    __syncthreads();
 
 #pragma unroll
     for (int k = 0; k < pairs_per_thread; ++k) {
@@ -1465,30 +1449,20 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
       if (col >= new_size) continue;
-      uint32_t total0 = 0;
-      uint32_t total1 = 0;
       // Phase 1 B operand: s_doc_vec under SelfJoin (see the staging note above).
+      const uint8_t* row_b;
       if constexpr (SelfJoin) {
-        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                       QueryLayout,
-                                                                       SelfJoin,
-                                                                       document_planes,
-                                                                       query_planes,
-                                                                       doc_row_bytes,
-                                                                       QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_doc_vec[col], total0, total1);
+        row_b = s_doc_vec[col];
       } else {
-        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                       QueryLayout,
-                                                                       SelfJoin,
-                                                                       document_planes,
-                                                                       query_planes,
-                                                                       doc_row_bytes,
-                                                                       QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
+        row_b = s_query_vec[col];
       }
-      acc0[k] += total0;
-      acc1[k] += total1;
+      cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
+                                                                     QueryLayout,
+                                                                     document_planes,
+                                                                     query_planes,
+                                                                     doc_row_bytes,
+                                                                     QUERY_ROW_BYTES>(
+        s_doc_vec[row0], s_doc_vec[row0 + 1], row_b, acc0[k], acc1[k]);
     }
     __syncthreads();
   }
@@ -1579,7 +1553,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                                 last_tile,
                                                                 warp_id,
                                                                 lane_id);
-      __syncthreads();
     }
     stage_tile_simt<query_planes, QUERY_ROW_BYTES + BBQ_PAD>(s_query_vec,
                                                              dataset_query,
@@ -1601,18 +1574,13 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
       if (col >= old_size) continue;
-      uint32_t total0 = 0;
-      uint32_t total1 = 0;
       cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
                                                                      QueryLayout,
-                                                                     SelfJoin,
                                                                      document_planes,
                                                                      query_planes,
                                                                      doc_row_bytes,
                                                                      QUERY_ROW_BYTES>(
-        s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
-      acc0_old[k] += total0;
-      acc1_old[k] += total1;
+        s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], acc0_old[k], acc1_old[k]);
     }
     __syncthreads();
   }
@@ -1670,9 +1638,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     }
   }
 
-  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
-  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
-  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
