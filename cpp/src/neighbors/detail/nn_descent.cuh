@@ -1228,31 +1228,22 @@ __device__ __forceinline__ void stage_tile_simt(
 }
 
 // packed_1b: one native word (1 bit/value, 8 values/byte, MSB-first) -> four 4-bit-width
-// packed_4b-style words. Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise,
-// spread each into a nibble, then transpose into per-native-byte output words with chained
-// __byte_perm pairs. packed_4b is already 4-bit-width, so it is a plain copy.
-template <bbq_layout Layout>
-__device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_t* out)
+// packed_4b-style words. Each byte's four 2-bit pairs are widened to nibble-pairs in parallel,
+// then a 4x4 byte transpose yields one promoted word per native byte.
+__device__ __forceinline__ uint4 packed_1b_to_4b(uint32_t native_word)
 {
-  if constexpr (Layout == bbq_layout::packed_1b) {
-    uint32_t spread[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const uint32_t field = (native_word >> (6 - 2 * j)) & 0x03030303u;
-      spread[j]            = ((field & 0x02020202u) << 3) | (field & 0x01010101u);
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      // sel picks: out byte0 = spread[.]'s byte i, out byte1 = spread[.]'s byte i of the second
-      // operand; byte2/3 are don't-care (masked off below).
-      const uint32_t sel = 0x00000040u + i * 0x00000011u;
-      const uint32_t lo  = __byte_perm(spread[0], spread[1], sel);
-      const uint32_t hi  = __byte_perm(spread[2], spread[3], sel);
-      out[i]             = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
-    }
-  } else {
-    out[0] = native_word;
-  }
+  const uint32_t spread0 = ((native_word >> 3) & 0x10101010u) | ((native_word >> 6) & 0x01010101u);
+  const uint32_t spread1 = ((native_word >> 1) & 0x10101010u) | ((native_word >> 4) & 0x01010101u);
+  const uint32_t spread2 = ((native_word << 1) & 0x10101010u) | ((native_word >> 2) & 0x01010101u);
+  const uint32_t spread3 = ((native_word << 3) & 0x10101010u) | (native_word & 0x01010101u);
+  const uint32_t t0      = __byte_perm(spread0, spread1, 0x5140);
+  const uint32_t t1      = __byte_perm(spread0, spread1, 0x7362);
+  const uint32_t t2      = __byte_perm(spread2, spread3, 0x5140);
+  const uint32_t t3      = __byte_perm(spread2, spread3, 0x7362);
+  return uint4{__byte_perm(t0, t2, 0x5410),
+               __byte_perm(t0, t2, 0x7632),
+               __byte_perm(t1, t3, 0x5410),
+               __byte_perm(t1, t3, 0x7632)};
 }
 
 // `native_row_bytes` is the layout's own encoded row length. One native tile is
@@ -1280,30 +1271,34 @@ __device__ __forceinline__ void stage_promoted_tile(
   constexpr int native_tile     = TileBytes / expansion;
   constexpr int native_tile_u32 = native_tile / 4;
   constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
+  // packed_4b's native tile is 32 u32s (one per lane). packed_1b's is 8, so a warp-per-row
+  // map would leave 24 lanes idle; instead pack warp_size/8 = 4 rows into one pass.
+  static_assert(raft::warp_size() % native_tile_u32 == 0);
+  constexpr int rows_per_pass = raft::warp_size() / native_tile_u32;
+  static_assert(MAX_NUM_BI_SAMPLES % (num_warps * rows_per_pass) == 0);
 
   const int base      = step * native_tile;
   const int remaining = native_row_bytes - base;
   const int num_load_u32 =
     (remaining < native_tile ? (remaining > 0 ? remaining : 0) : native_tile) / 4;
 
-  for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-    const int idx = i * num_warps + warp_id;
+  for (int i = 0; i < MAX_NUM_BI_SAMPLES / (num_warps * rows_per_pass); ++i) {
+    const int idx = (i * num_warps + warp_id) * rows_per_pass + lane_id / native_tile_u32;
+    const int w   = lane_id % native_tile_u32;
     if (idx >= count) continue;
     auto* s         = reinterpret_cast<uint32_t*>(dst[idx]);
     const auto* src = reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base));
-    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
-      uint32_t out[expansion];
-      promote_word_to_4b<Layout>(src[w], out);
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s[expansion * w + e] = out[e];
+    if (w < num_load_u32) {
+      if constexpr (expansion == 4) {
+        reinterpret_cast<uint4*>(s)[w] = packed_1b_to_4b(src[w]);
+      } else {
+        s[w] = src[w];
       }
-    }
-    // No-op unless this is the last tile and the row doesn't fill it.
-    for (int w = num_load_u32 + lane_id; w < native_tile_u32; w += raft::warp_size()) {
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s[expansion * w + e] = 0;
+    } else {
+      if constexpr (expansion == 4) {
+        reinterpret_cast<uint4*>(s)[w] = uint4{0, 0, 0, 0};
+      } else {
+        s[w] = 0;
       }
     }
   }
@@ -2184,6 +2179,63 @@ int insert_to_ordered_list(InternalID_t<Index_t>* list,
   return idx_insert;
 };
 
+// Copies `h_graph` (stride `in_degree`) into `out` (stride `out_degree`), dropping self-edges and
+// repeated ids, then pads each short list with distinct random ids.
+//
+// The device-side lists can hold the same id twice: insert_to_global_graph only rejects an
+// incoming element when it compares equal to its immediate sorted neighbours, which misses a
+// second copy that arrived with a different distance.
+template <typename Index_t>
+void shrink_graph_removing_duplicates(Index_t* out,
+                                      const InternalID_t<Index_t>* h_graph,
+                                      const size_t nrow,
+                                      const size_t in_degree,
+                                      const size_t out_degree)
+{
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow; i++) {
+    auto* output_neighbor_list_ptr = out + i * out_degree;
+
+    size_t out_j = 0;
+    for (size_t in_j = 0; in_j < out_degree; in_j++) {
+      size_t idx = h_graph[i * in_degree + in_j].id();
+      // Unfilled slots carry a sentinel id; leave them to the random fill below.
+      if (idx >= nrow) { continue; }
+
+      bool dup = false;
+      for (size_t exi_j = 0; exi_j < out_j; exi_j++) {
+        if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        output_neighbor_list_ptr[out_j] = idx;
+        out_j++;
+      }
+    }
+
+    // Fill with random nodes if the length of the filled neighbor list is less than the degree.
+    for (size_t j = out_j; j < out_degree; j++) {
+      uint64_t rnd = static_cast<uint64_t>(i * out_degree + j + 1);
+      uint64_t idx;
+      bool dup = true;
+      for (size_t attempts = 0; dup && attempts < out_degree; attempts++) {
+        rnd = cuvs::neighbors::detail::device::xorshift64(rnd);
+        idx = rnd % nrow;
+        dup = false;
+        for (size_t exi_j = 0; exi_j < j; exi_j++) {
+          if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
+            dup = true;
+            break;
+          }
+        }
+      }
+      output_neighbor_list_ptr[j] = static_cast<Index_t>(idx);
+    }
+  }
+}
+
 }  // namespace
 
 template <typename Index_t>
@@ -2891,49 +2943,8 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
 
   Index_t* graph_shrink_buffer = (Index_t*)graph_.h_dists.data_handle();
 
-  // Copy the output graph while removing duplicates.
-#pragma omp parallel for
-  for (size_t i = 0; i < (size_t)nrow_; i++) {
-    auto output_neighbor_list_ptr = graph_shrink_buffer + i * build_config_.node_degree;
-
-    size_t out_j = 0;
-
-    // Copy neighbor list while removing duplicates.
-    for (size_t in_j = 0; in_j < build_config_.node_degree; in_j++) {
-      size_t idx = graph_.h_graph[i * graph_.node_degree + in_j].id();
-
-      bool dup = false;
-      for (size_t exi_j = 0; exi_j < out_j; exi_j++) {
-        if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
-          dup = true;
-          break;
-        }
-      }
-      if (!dup) {
-        output_neighbor_list_ptr[out_j] = idx;
-        out_j++;
-      }
-    }
-
-    // Fill with random nodes if the length of the filled neighbor list is less than the degree.
-    for (size_t j = out_j; j < build_config_.node_degree; j++) {
-      uint64_t rnd = static_cast<uint64_t>(i * build_config_.node_degree + j + 1);
-      uint64_t idx;
-      bool dup = true;
-      for (size_t attempts = 0; dup && attempts < build_config_.node_degree; attempts++) {
-        rnd = cuvs::neighbors::detail::device::xorshift64(rnd);
-        idx = rnd % nrow_;
-        dup = false;
-        for (size_t exi_j = 0; exi_j < j; exi_j++) {
-          if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
-            dup = true;
-            break;
-          }
-        }
-      }
-      output_neighbor_list_ptr[j] = static_cast<int>(idx);
-    }
-  }
+  shrink_graph_removing_duplicates(
+    graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
   graph_.h_graph = nullptr;
 
 #pragma omp parallel for
@@ -3050,16 +3061,9 @@ void GNND<Data_t, Index_t>::build(cuvs::neighbors::device_bbq_dataset_view<int64
   }
 
   auto* graph_shrink_buffer = reinterpret_cast<Index_t*>(graph_.h_dists.data_handle());
-#pragma omp parallel for
-  for (size_t i = 0; i < nrow_; ++i) {
-    for (size_t j = 0; j < build_config_.node_degree; ++j) {
-      const size_t index = i * graph_.node_degree + j;
-      const int id       = graph_.h_graph[index].id();
-      graph_shrink_buffer[i * build_config_.node_degree + j] =
-        id < static_cast<int>(nrow_) ? id
-                                     : cuvs::neighbors::detail::device::xorshift64(index) % nrow_;
-    }
-  }
+
+  shrink_graph_removing_duplicates(
+    graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
   graph_.h_graph = nullptr;
 
 #pragma omp parallel for
