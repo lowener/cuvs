@@ -285,41 +285,6 @@ __device__ __forceinline__ void load_vec(__half* vec_buffer,
   }
 }
 
-template <int n_planes>
-__device__ inline void load_vec_bbq_simt(uint32_t* vec_buffer,
-                                         const uint32_t* d_vec,
-                                         int plane_extent,
-                                         int num_load,
-                                         int plane_tile,
-                                         int lane_id)
-{
-  // Loads only [0, num_load) per plane. Callers are responsible for zeroing the padding
-  // [num_load, plane_tile) on the last tile (see the step == n_tiles - 1 branch at the
-  // call site) -- this keeps the load loop branch-free and minimizes live registers.
-  for (int idx = lane_id; idx < num_load; idx += raft::warp_size()) {
-#pragma unroll
-    for (int p = 0; p < n_planes; ++p) {
-      vec_buffer[p * plane_tile + idx] = d_vec[p * plane_extent + idx];
-    }
-  }
-}
-
-// Zero the per-plane padding [num_load, plane_tile) so the dot product's full-tile read sees
-// zeros beyond the real data. Called at the load site only when step == n_tiles - 1.
-template <int n_planes>
-__device__ inline void zero_pad_bbq_simt(uint32_t* vec_buffer,
-                                         int num_load,
-                                         int plane_tile,
-                                         int lane_id)
-{
-  for (int idx = num_load + lane_id; idx < plane_tile; idx += raft::warp_size()) {
-#pragma unroll
-    for (int p = 0; p < n_planes; ++p) {
-      vec_buffer[p * plane_tile + idx] = 0;
-    }
-  }
-}
-
 /** One warp per block. Computes squared L2 norm for each row. */
 template <typename Data_t>
 RAFT_KERNEL compute_l2_norms_kernel(const Data_t* data, int dim, DistData_t* l2_norms)
@@ -1175,10 +1140,11 @@ using cuvs::preprocessing::quantize::bbq::get_dequant_factors;
 using cuvs::preprocessing::quantize::bbq::promote_packed_1b_word_to_4b;
 using cuvs::preprocessing::quantize::bbq::promote_word_to_4b;
 
-// Stages one tile of `count` rows into a SIMT shared-memory buffer, zero-padding a short last
-// tile. The SIMT counterpart of stage_promoted_tile: it folds the same warp-strided row loop,
-// per-plane load and tail zero-fill into one call, so the four staging sites in the SIMT kernel
-// read like the wmma kernel's.
+// Stages one K-tile of `count` neighbor rows into SMEM. Shared skeleton: one warp per row,
+// lanes strided along native uint32 words, last-tile zero-pad so compute reads a full tile.
+//
+// stage_tile_simt copies native codes in storage layout (Planes > 1 gathers bit-sliced planes).
+// stage_promoted_tile expands packed_1b to u4 for int4 MMA (packed_4b is a plain copy).
 template <int Planes, int RowStride, typename DataT, typename Index_t>
 __device__ __forceinline__ void stage_tile_simt(
   uint8_t (*dst)[RowStride],
@@ -1197,15 +1163,104 @@ __device__ __forceinline__ void stage_tile_simt(
   for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
     const int idx = i * num_warps + warp_id;
     if (idx >= count) continue;
-    auto* s = reinterpret_cast<uint32_t*>(dst[idx]);
-    load_vec_bbq_simt<Planes>(
-      s,
-      reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base)),
-      plane_extent,
-      num_load_u32,
-      plane_tile_u32,
-      lane_id);
-    if (last_tile) { zero_pad_bbq_simt<Planes>(s, num_load_u32, plane_tile_u32, lane_id); }
+    auto* s         = reinterpret_cast<uint32_t*>(dst[idx]);
+    const auto* src = reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base));
+    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
+#pragma unroll
+      for (int p = 0; p < Planes; ++p) {
+        s[p * plane_tile_u32 + w] = src[p * plane_extent + w];
+      }
+    }
+    if (last_tile) {
+      for (int w = num_load_u32 + lane_id; w < plane_tile_u32; w += raft::warp_size()) {
+#pragma unroll
+        for (int p = 0; p < Planes; ++p) {
+          s[p * plane_tile_u32 + w] = 0;
+        }
+      }
+    }
+  }
+}
+
+// packed_1b: one native word (1 bit/value, 8 values/byte, MSB-first) -> four 4-bit-width
+// packed_4b-style words. Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise,
+// spread each into a nibble, then transpose into per-native-byte output words with chained
+// __byte_perm pairs. packed_4b is already 4-bit-width, so it is a plain copy.
+template <bbq_layout Layout>
+__device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_t* out)
+{
+  if constexpr (Layout == bbq_layout::packed_1b) {
+    uint32_t spread[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t field = (native_word >> (6 - 2 * j)) & 0x03030303u;
+      spread[j]            = ((field & 0x02020202u) << 3) | (field & 0x01010101u);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      // sel picks: out byte0 = spread[.]'s byte i, out byte1 = spread[.]'s byte i of the second
+      // operand; byte2/3 are don't-care (masked off below).
+      const uint32_t sel = 0x00000040u + i * 0x00000011u;
+      const uint32_t lo  = __byte_perm(spread[0], spread[1], sel);
+      const uint32_t hi  = __byte_perm(spread[2], spread[3], sel);
+      out[i]             = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
+    }
+  } else {
+    out[0] = native_word;
+  }
+}
+
+// `native_row_bytes` is the layout's own encoded row length. One native tile is
+// RowStride-independent: BBQ_ROW_BYTES / expansion native bytes promote to exactly BBQ_ROW_BYTES
+// promoted bytes, so a single n_tiles drives every operand regardless of how compact each one's
+// on-disk format is.
+template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
+__device__ __forceinline__ void stage_promoted_tile(
+  uint8_t (*dst)[RowStride],
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
+  const Index_t* neighbors,
+  const int count,
+  const int step,
+  const int native_row_bytes,
+  const int warp_id,
+  const int lane_id)
+{
+  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
+                "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
+  // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
+  // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
+  // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
+  // promoted query works exactly like a promoted document.
+  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
+  constexpr int native_tile     = TileBytes / expansion;
+  constexpr int native_tile_u32 = native_tile / 4;
+  constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
+
+  const int base      = step * native_tile;
+  const int remaining = native_row_bytes - base;
+  const int num_load_u32 =
+    (remaining < native_tile ? (remaining > 0 ? remaining : 0) : native_tile) / 4;
+
+  for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+    const int idx = i * num_warps + warp_id;
+    if (idx >= count) continue;
+    auto* s         = reinterpret_cast<uint32_t*>(dst[idx]);
+    const auto* src = reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base));
+    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
+      uint32_t out[expansion];
+      promote_word_to_4b<Layout>(src[w], out);
+#pragma unroll
+      for (int e = 0; e < expansion; ++e) {
+        s[expansion * w + e] = out[e];
+      }
+    }
+    // No-op unless this is the last tile and the row doesn't fill it.
+    for (int w = num_load_u32 + lane_id; w < native_tile_u32; w += raft::warp_size()) {
+#pragma unroll
+      for (int e = 0; e < expansion; ++e) {
+        s[expansion * w + e] = 0;
+      }
+    }
   }
 }
 
@@ -1651,64 +1706,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                  new_size);
     if (min_elem.id() < gridDim.x) {
       insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
-    }
-  }
-}
-
-// Stages one K-tile of `count` rows from `quantizer` into a 4-bit-width SMEM buffer, promoting
-// each native word via promote_word_to_4b<Layout>. One warp per row (rows strided by
-// num_warps), lanes strided across the row's native words; the tail past the row's end is zeroed
-// so the MMA sees defined data. `native_row_bytes` is the layout's own encoded row length, and
-// one native tile is RowStride-independent: BBQ_ROW_BYTES / expansion native bytes promote to
-// exactly BBQ_ROW_BYTES promoted bytes, so a single n_tiles drives every operand regardless of
-// how compact each one's on-disk format is.
-template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
-__device__ __forceinline__ void stage_promoted_tile(
-  uint8_t (*dst)[RowStride],
-  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
-  const Index_t* neighbors,
-  const int count,
-  const int step,
-  const int native_row_bytes,
-  const int warp_id,
-  const int lane_id)
-{
-  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
-                "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
-  // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
-  // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
-  // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
-  // promoted query works exactly like a promoted document.
-  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
-  constexpr int native_tile     = TileBytes / expansion;
-  constexpr int native_tile_u32 = native_tile / 4;
-  constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
-
-  const int native_base = step * native_tile;
-  const int remaining   = native_row_bytes - native_base;
-  const int num_load_u32 =
-    (remaining < native_tile ? (remaining > 0 ? remaining : 0) : native_tile) / 4;
-
-  for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-    const int idx = i * num_warps + warp_id;
-    if (idx >= count) continue;
-    auto* s_u32 = reinterpret_cast<uint32_t*>(dst[idx]);
-    const uint32_t* src =
-      reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], native_base));
-    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
-      uint32_t out[expansion];
-      promote_word_to_4b<Layout>(src[w], out);
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s_u32[expansion * w + e] = out[e];
-      }
-    }
-    // No-op unless this is the last tile and the row doesn't fill it.
-    for (int w = num_load_u32 + lane_id; w < native_tile_u32; w += raft::warp_size()) {
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s_u32[expansion * w + e] = 0;
-      }
     }
   }
 }
@@ -2505,7 +2502,7 @@ void GNND<Data_t, Index_t>::local_join(
                             : has_1b  ? dataset.get_quantizer(1, L::packed_1b)
                                       : dataset.get_quantizer(2, L::transposed_2b);
 
-  // load_vec_bbq_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
+  // stage_tile_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
   // must be 4-byte aligned.
   {
     const auto len     = bbq::get_encoded_row_length(quantizer_query);
