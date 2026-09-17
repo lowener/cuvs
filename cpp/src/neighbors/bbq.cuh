@@ -259,13 +259,12 @@ __device__ inline void code_inner_product_packed_8b_2x1(const uint8_t* row_a0,
 }
 
 // Selects the SIMT inner product for a (document, query) layout pair: bit-sliced layouts go to the
-// cross-plane popc, densely-packed ones to dp4a. The dp4a forms are self-join only, since dp4a
-// needs both operands in the same packing. packed_7b and packed_8b reach this from
+// cross-plane popc, densely-packed ones to dp4a. dp4a needs both operands in the same packing, so
+// those forms apply whenever the two layouts match. packed_7b and packed_8b reach this from
 // GNND::local_join; packed_4b does not (symmetric packed_4b goes to the wmma kernel), but is kept
 // as a SIMT reference point.
 template <bbq_code_layout DocumentLayout,
           bbq_code_layout QueryLayout,
-          bool SelfJoin,
           int DocumentPlanes,
           int QueryPlanes,
           size_t DocumentRowBytes,
@@ -277,11 +276,12 @@ __device__ __forceinline__ void bbq_code_inner_product_2x1(const uint8_t* row_a0
                                                            uint32_t& total1)
 {
   namespace bbq = cuvs::preprocessing::quantize::bbq;
-  if constexpr (SelfJoin && DocumentLayout == bbq_code_layout::packed_4b) {
+  if constexpr (DocumentLayout == QueryLayout && DocumentLayout == bbq_code_layout::packed_4b) {
     bbq::code_inner_product_packed_4b_symmetric_2x1<DocumentRowBytes>(
       row_a0, row_a1, row_b, total0, total1);
-  } else if constexpr (SelfJoin && (DocumentLayout == bbq_code_layout::packed_8b ||
-                                    DocumentLayout == bbq_code_layout::packed_7b)) {
+  } else if constexpr (DocumentLayout == QueryLayout &&
+                       (DocumentLayout == bbq_code_layout::packed_8b ||
+                        DocumentLayout == bbq_code_layout::packed_7b)) {
     // packed_7b is packed_8b with the top bit masked off, matching code_inner_product's
     // (1 << bits) - 1 mask for the same two layouts.
     constexpr uint8_t code_mask = DocumentLayout == bbq_code_layout::packed_7b ? 0x7Fu : 0xFFu;
