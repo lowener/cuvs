@@ -41,9 +41,9 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
   return 0;
 }
 
-template <typename DataT, typename IdxT, typename Accessor>
+template <typename DataT, typename IdxT>
 _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(
-  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
+  const device_bbq_quantizer_view<DataT, IdxT>& dataset)
 {
   return get_encoded_row_length(dataset.layout, dataset.bits, dataset.dim());
 }

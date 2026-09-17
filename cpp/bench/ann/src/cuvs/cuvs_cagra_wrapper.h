@@ -202,7 +202,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   {
     if constexpr (std::is_same_v<T, float>) {
       if (index_params_.bbq.has_value()) {
-        bbq_dataset_ = std::make_shared<cuvs::neighbors::device_bbq_dataset<int64_t>>(
+        bbq_dataset_ = std::make_shared<cuvs::neighbors::device_bbq_dataset<float, int64_t>>(
           cuvs_internal::bbq::quantize_to_device(handle_,
                                                  dataset,
                                                  static_cast<int64_t>(nrow),
@@ -299,7 +299,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   std::shared_ptr<cuvs::neighbors::device_vpq_dataset<half, int64_t>> vpq_dataset_;
   std::shared_ptr<cuvs::neighbors::cagra::vpq_f16_index<T, IdxT>> vpq_index_;
   // Set by prepare_build() when BBQ is on; dropped as soon as the kNN graph is out.
-  std::shared_ptr<cuvs::neighbors::device_bbq_dataset<int64_t>> bbq_dataset_;
+  std::shared_ptr<cuvs::neighbors::device_bbq_dataset<float, int64_t>> bbq_dataset_;
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {

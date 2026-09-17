@@ -1452,6 +1452,7 @@ if(NOT BUILD_CPU_ONLY)
     src/preprocessing/quantize/scalar.cu
     src/preprocessing/quantize/binary.cu
     src/preprocessing/quantize/pq.cu
+    src/preprocessing/quantize/bbq.cu
     src/preprocessing/spectral/spectral_embedding.cu
     src/preprocessing/pca/pca.cu
     ${select_k_inst_files}

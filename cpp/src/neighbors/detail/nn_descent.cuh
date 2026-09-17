@@ -52,8 +52,8 @@
 namespace cuvs::neighbors::nn_descent::detail {
 
 template <typename DataT, typename IdxT>
-using bbq_device_quantizer_view = cuvs::preprocessing::quantize::bbq::
-  bbq_quantizer_view<DataT, IdxT, cuvs::neighbors::detail::device_view_accessor<const DataT>>;
+using device_bbq_quantizer_view =
+  cuvs::preprocessing::quantize::bbq::device_bbq_quantizer_view<DataT, IdxT>;
 using bbq_layout = cuvs::preprocessing::quantize::bbq::bbq_code_layout;
 
 template <typename Index_t>
@@ -1186,8 +1186,8 @@ __device__ __forceinline__ float bbq_calculate_metric(
   uint32_t raw,
   const bbq_dequant_factors& doc_factors,
   const bbq_dequant_factors& query_factors,
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_document,
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer_query,
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer_document,
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer_query,
   cuvs::distance::DistanceType metric,
   DistEpilogue_t dist_epilogue,
   Index_t document_id,
@@ -1227,7 +1227,7 @@ __device__ __forceinline__ float bbq_calculate_metric(
 template <int Planes, int RowStride, typename DataT, typename Index_t>
 __device__ __forceinline__ void stage_tile_simt(
   uint8_t (*dst)[RowStride],
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer,
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
   const Index_t* neighbors,
   const int count,
   const size_t base,
@@ -1309,8 +1309,8 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                              const Index_t* rev_graph_old,
                              const int2* sizes_old,
                              const int width,
-                             bbq_device_quantizer_view<DataT, int64_t> dataset_document,
-                             bbq_device_quantizer_view<DataT, int64_t> dataset_query,
+                             device_bbq_quantizer_view<DataT, int64_t> dataset_document,
+                             device_bbq_quantizer_view<DataT, int64_t> dataset_query,
                              ID_t* graph,
                              DistData_t* dists,
                              int graph_width,
@@ -1801,7 +1801,7 @@ __device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_
 template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
 __device__ __forceinline__ void stage_promoted_tile(
   uint8_t (*dst)[RowStride],
-  const bbq_device_quantizer_view<DataT, int64_t>& quantizer,
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
   const Index_t* neighbors,
   const int count,
   const int step,
@@ -1889,8 +1889,8 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                              const Index_t* rev_graph_old,
                              const int2* sizes_old,
                              const int width,
-                             const bbq_device_quantizer_view<DataT, int64_t> dataset_document,
-                             const bbq_device_quantizer_view<DataT, int64_t> dataset_query,
+                             const device_bbq_quantizer_view<DataT, int64_t> dataset_document,
+                             const device_bbq_quantizer_view<DataT, int64_t> dataset_query,
                              ID_t* graph,
                              DistData_t* dists,
                              int graph_width,
@@ -2613,9 +2613,10 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream, DistEpilogue_t dist_
 
 template <typename Data_t, typename Index_t>
 template <typename DistEpilogue_t>
-void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
-                                       cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
-                                       DistEpilogue_t dist_epilogue)
+void GNND<Data_t, Index_t>::local_join(
+  cudaStream_t stream,
+  cuvs::neighbors::device_bbq_dataset_view<std::remove_const_t<Data_t>, int64_t> dataset,
+  DistEpilogue_t dist_epilogue)
 {
   namespace bbq = cuvs::preprocessing::quantize::bbq;
   using L       = bbq_layout;
@@ -3025,11 +3026,12 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
 
 template <typename Data_t, typename Index_t>
 template <typename DistEpilogue_t>
-void GNND<Data_t, Index_t>::build(cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
-                                  Index_t* output_graph,
-                                  bool return_distances,
-                                  DistData_t* output_distances,
-                                  DistEpilogue_t dist_epilogue)
+void GNND<Data_t, Index_t>::build(
+  cuvs::neighbors::device_bbq_dataset_view<std::remove_const_t<Data_t>, int64_t> dataset,
+  Index_t* output_graph,
+  bool return_distances,
+  DistData_t* output_distances,
+  DistEpilogue_t dist_epilogue)
 {
   cudaStream_t stream = raft::resource::get_cuda_stream(res);
   nrow_               = static_cast<size_t>(dataset.n_rows());
@@ -3149,10 +3151,10 @@ void GNND<Data_t, Index_t>::build(cuvs::neighbors::device_bbq_dataset_view<int64
   }
 }
 
-template <typename IdxT = uint32_t>
+template <typename DataT, typename IdxT = uint32_t>
 void build(raft::resources const& res,
            const index_params& params,
-           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
+           cuvs::neighbors::device_bbq_dataset_view<DataT, int64_t> dataset,
            index<IdxT>& idx)
 {
   RAFT_EXPECTS(dataset.quantizers.size() > 0, "BBQ dataset must not be empty.");
@@ -3184,7 +3186,7 @@ void build(raft::resources const& res,
                                        graph_degree);
   auto int_graph =
     raft::make_host_matrix<int, int64_t, raft::row_major>(dataset.n_rows(), extended_graph_degree);
-  GNND<const uint8_t, int> nnd(res, build_config);
+  GNND<const DataT, int> nnd(res, build_config);
 
   if (idx.distances().has_value() || !params.return_distances) {
     nnd.build(dataset,
@@ -3265,10 +3267,10 @@ void build(raft::resources const& res,
   }
 }
 
-template <typename IdxT = uint32_t>
+template <typename DataT, typename IdxT = uint32_t>
 index<IdxT> build(raft::resources const& res,
                   const index_params& params,
-                  cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset)
+                  cuvs::neighbors::device_bbq_dataset_view<DataT, int64_t> dataset)
 {
   size_t graph_degree = params.graph_degree;
   if (params.intermediate_graph_degree < graph_degree) {
@@ -3285,7 +3287,7 @@ index<IdxT> build(raft::resources const& res,
                   static_cast<int64_t>(graph_degree),
                   params.return_distances,
                   params.metric};
-  build(res, params, dataset, idx);
+  detail::build<DataT, IdxT>(res, params, dataset, idx);
   return idx;
 }
 

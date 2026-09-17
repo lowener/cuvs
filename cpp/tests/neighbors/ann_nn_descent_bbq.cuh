@@ -141,20 +141,7 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
       raft::update_host(host_data.data(), database.data_handle(), host_data.size(), stream_);
       raft::resource::sync_stream(handle_);
 
-      auto bbq_host_storage =
-        cpu_bbq::quantize(host_data, ps.n_rows, ps.dim, ps.bits, ps.metric, ps.layout);
-      auto bbq_host = cuvs::neighbors::host_bbq_dataset<int64_t>{std::move(bbq_host_storage)};
-
-      if (ps.second_dataset_layout.has_value()) {
-        auto bbq_host_second_storage = cpu_bbq::quantize(host_data,
-                                                         ps.n_rows,
-                                                         ps.dim,
-                                                         bits_of(ps.second_dataset_layout.value()),
-                                                         ps.metric,
-                                                         ps.second_dataset_layout.value());
-        bbq_host.add_quantizer(std::move(bbq_host_second_storage));
-      }
-      auto owning_dataset = make_device_bbq_dataset(handle_, bbq_host);
+      auto owning_dataset = cuvs_internal::bbq::quantize_to_device(handle_, host_data.data(), ps.n_rows, ps.dim, ps.metric, ps.layout, ps.second_dataset_layout.value_or(ps.layout));
       auto dataset        = owning_dataset.as_dataset_view();
       nn_descent::index_params index_params;
       index_params.metric                    = ps.metric;
