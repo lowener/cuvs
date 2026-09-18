@@ -346,65 +346,52 @@ auto copy_bbq_owning_storage_host_to_device(raft::resources const& res,
                                             host_quantizer_storage const& host_storage) ->
   typename cuvs::neighbors::device_bbq_dataset<float, IdxT>::owning_storage_type
 {
+  using device_storage =
+    typename cuvs::neighbors::device_bbq_dataset<float, IdxT>::owning_storage_type;
   auto stream = raft::resource::get_cuda_stream(res);
-  auto codes  = raft::make_device_matrix<uint8_t, IdxT>(
-    res, host_storage.codes.extent(0), host_storage.codes.extent(1));
-  auto lower_intervals =
-    raft::make_device_vector<float, IdxT>(res, host_storage.lower_intervals.extent(0));
-  auto upper_intervals =
-    raft::make_device_vector<float, IdxT>(res, host_storage.upper_intervals.extent(0));
-  auto additional_corrections =
-    raft::make_device_vector<float, IdxT>(res, host_storage.additional_corrections.extent(0));
-  auto quantized_component_sums =
-    raft::make_device_vector<int32_t, IdxT>(res, host_storage.quantized_component_sums.extent(0));
-  auto centroid = raft::make_device_vector<float, IdxT>(res, host_storage.centroid.extent(0));
-  auto dequant_delta =
-    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_delta.extent(0));
-  auto dequant_sum_delta =
-    raft::make_device_vector<float, IdxT>(res, host_storage.dequant_sum_delta.extent(0));
-  auto row_norm = raft::make_device_vector<float, IdxT>(res, host_storage.row_norm.extent(0));
+  device_storage device{res,
+                        static_cast<IdxT>(host_storage.codes.extent(0)),
+                        static_cast<uint32_t>(host_storage.centroid.extent(0)),
+                        host_storage.bits,
+                        host_storage.layout,
+                        host_storage.metric};
 
-  raft::copy(codes.data_handle(), host_storage.codes.data_handle(), codes.size(), stream);
-  raft::copy(lower_intervals.data_handle(),
+  raft::copy(
+    device.codes.data_handle(), host_storage.codes.data_handle(), device.codes.size(), stream);
+  raft::copy(device.lower_intervals.data_handle(),
              host_storage.lower_intervals.data_handle(),
-             lower_intervals.size(),
+             device.lower_intervals.size(),
              stream);
-  raft::copy(upper_intervals.data_handle(),
+  raft::copy(device.upper_intervals.data_handle(),
              host_storage.upper_intervals.data_handle(),
-             upper_intervals.size(),
+             device.upper_intervals.size(),
              stream);
-  raft::copy(additional_corrections.data_handle(),
+  raft::copy(device.additional_corrections.data_handle(),
              host_storage.additional_corrections.data_handle(),
-             additional_corrections.size(),
+             device.additional_corrections.size(),
              stream);
-  raft::copy(quantized_component_sums.data_handle(),
+  raft::copy(device.quantized_component_sums.data_handle(),
              host_storage.quantized_component_sums.data_handle(),
-             quantized_component_sums.size(),
+             device.quantized_component_sums.size(),
              stream);
-  raft::copy(centroid.data_handle(), host_storage.centroid.data_handle(), centroid.size(), stream);
-  raft::copy(dequant_delta.data_handle(),
+  raft::copy(device.centroid.data_handle(),
+             host_storage.centroid.data_handle(),
+             device.centroid.size(),
+             stream);
+  raft::copy(device.dequant_delta.data_handle(),
              host_storage.dequant_delta.data_handle(),
-             dequant_delta.size(),
+             device.dequant_delta.size(),
              stream);
-  raft::copy(dequant_sum_delta.data_handle(),
+  raft::copy(device.dequant_sum_delta.data_handle(),
              host_storage.dequant_sum_delta.data_handle(),
-             dequant_sum_delta.size(),
+             device.dequant_sum_delta.size(),
              stream);
-  raft::copy(row_norm.data_handle(), host_storage.row_norm.data_handle(), row_norm.size(), stream);
-
-  return {std::move(codes),
-          std::move(lower_intervals),
-          std::move(upper_intervals),
-          std::move(additional_corrections),
-          std::move(quantized_component_sums),
-          std::move(centroid),
-          std::move(dequant_delta),
-          std::move(dequant_sum_delta),
-          std::move(row_norm),
-          host_storage.bits,
-          host_storage.layout,
-          host_storage.metric,
-          host_storage.centroid_norm_sq};
+  raft::copy(device.row_norm.data_handle(),
+             host_storage.row_norm.data_handle(),
+             device.row_norm.size(),
+             stream);
+  device.centroid_norm_sq = host_storage.centroid_norm_sq;
+  return device;
 }
 
 template <typename IdxT>

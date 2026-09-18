@@ -11,6 +11,7 @@
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
+#include <raft/core/resources.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -70,42 +71,27 @@ struct bbq_quantizer {
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
-  bbq_quantizer(
-    raft::device_mdarray<uint8_t, raft::matrix_extent<IdxT>>&& codes_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& lower_intervals_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& upper_intervals_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& additional_corrections_,
-    raft::device_mdarray<int32_t, raft::vector_extent<IdxT>>&& quantized_component_sums_,
-    raft::device_mdarray<DataT, raft::vector_extent<IdxT>>&& centroid_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_delta_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& dequant_sum_delta_,
-    raft::device_mdarray<float, raft::vector_extent<IdxT>>&& row_norm_,
-    uint32_t bits,
-    bbq_code_layout layout,
-    cuvs::distance::DistanceType metric,
-    float centroid_norm_sq)
-    : codes{std::move(codes_)},
-      lower_intervals{std::move(lower_intervals_)},
-      upper_intervals{std::move(upper_intervals_)},
-      additional_corrections{std::move(additional_corrections_)},
-      quantized_component_sums{std::move(quantized_component_sums_)},
-      centroid{std::move(centroid_)},
-      dequant_delta{std::move(dequant_delta_)},
-      dequant_sum_delta{std::move(dequant_sum_delta_)},
-      row_norm{std::move(row_norm_)},
+  bbq_quantizer(raft::resources const& res,
+                IdxT n_rows,
+                uint32_t dim,
+                uint32_t bits,
+                bbq_code_layout layout,
+                cuvs::distance::DistanceType metric)
+    : codes{raft::make_device_matrix<uint8_t, IdxT>(
+        res, n_rows, static_cast<IdxT>(encoded_row_length_for(dim, bits, layout)))},
+      lower_intervals{raft::make_device_vector<float, IdxT>(res, n_rows)},
+      upper_intervals{raft::make_device_vector<float, IdxT>(res, n_rows)},
+      additional_corrections{raft::make_device_vector<float, IdxT>(res, n_rows)},
+      quantized_component_sums{raft::make_device_vector<int32_t, IdxT>(res, n_rows)},
+      centroid{raft::make_device_vector<DataT, IdxT>(res, static_cast<IdxT>(dim))},
+      dequant_delta{raft::make_device_vector<float, IdxT>(res, n_rows)},
+      dequant_sum_delta{raft::make_device_vector<float, IdxT>(res, n_rows)},
+      row_norm{raft::make_device_vector<float, IdxT>(res, n_rows)},
       bits{bits},
       layout{layout},
-      metric{metric},
-      centroid_norm_sq{centroid_norm_sq}
+      metric{metric}
   {
-    const auto n_rows = static_cast<int64_t>(codes.extent(0));
     RAFT_EXPECTS(bits >= 1 && bits <= 8, "BBQ bits must be in [1, 8].");
-    RAFT_EXPECTS(codes.extent(1) == static_cast<int64_t>(encoded_row_length()),
-                 "BBQ code row length does not match dim, bits, and layout.");
-    RAFT_EXPECTS(lower_intervals.extent(0) == n_rows && upper_intervals.extent(0) == n_rows &&
-                   additional_corrections.extent(0) == n_rows &&
-                   quantized_component_sums.extent(0) == n_rows && row_norm.extent(0) == n_rows,
-                 "Every BBQ correction array must contain one value per row.");
   }
 
   [[nodiscard]] auto n_rows() const noexcept -> IdxT { return codes.extent(0); }
@@ -113,18 +99,24 @@ struct bbq_quantizer {
   {
     return static_cast<uint32_t>(centroid.extent(0));
   }
-  [[nodiscard]] constexpr auto encoded_row_length() const noexcept -> uint32_t
+  [[nodiscard]] static constexpr auto encoded_row_length_for(uint32_t dim,
+                                                             uint32_t bits,
+                                                             bbq_code_layout layout) noexcept
+    -> uint32_t
   {
-    auto const d = dim();
     switch (layout) {
-      case bbq_code_layout::packed_1b: return (d * bits + 7) / 8;
-      case bbq_code_layout::transposed_2b: return bits * ((d + 7) / 8);
-      case bbq_code_layout::packed_4b: return (d + 1) / 2;
-      case bbq_code_layout::packed_7b: return d;
-      case bbq_code_layout::packed_8b: return d;
-      case bbq_code_layout::transposed_4b: return 4 * ((d + 7) / 8);
+      case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
+      case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
+      case bbq_code_layout::packed_4b: return (dim + 1) / 2;
+      case bbq_code_layout::packed_7b: return dim;
+      case bbq_code_layout::packed_8b: return dim;
+      case bbq_code_layout::transposed_4b: return 4 * ((dim + 7) / 8);
     }
     return 0;
+  }
+  [[nodiscard]] constexpr auto encoded_row_length() const noexcept -> uint32_t
+  {
+    return encoded_row_length_for(dim(), bits, layout);
   }
 };
 
