@@ -51,10 +51,8 @@
 
 namespace cuvs::neighbors::nn_descent::detail {
 
-template <typename DataT, typename IdxT>
-using device_bbq_quantizer_view =
-  cuvs::preprocessing::quantize::bbq::device_bbq_quantizer_view<DataT, IdxT>;
-using bbq_layout = cuvs::preprocessing::quantize::bbq::bbq_code_layout;
+using cuvs::preprocessing::quantize::bbq::bbq_code_layout;
+using cuvs::preprocessing::quantize::bbq::device_bbq_quantizer_view;
 
 template <typename Index_t>
 struct ResultItem;
@@ -1185,7 +1183,7 @@ __device__ __forceinline__ void stage_tile_simt(
 // RowStride-independent: BBQ_ROW_BYTES / expansion native bytes promote to exactly BBQ_ROW_BYTES
 // promoted bytes, so a single n_tiles drives every operand regardless of how compact each one's
 // on-disk format is.
-template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
+template <bbq_code_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
 __device__ __forceinline__ void stage_promoted_tile(
   uint8_t (*dst)[RowStride],
   const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
@@ -1196,13 +1194,13 @@ __device__ __forceinline__ void stage_promoted_tile(
   const int warp_id,
   const int lane_id)
 {
-  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
+  static_assert(Layout == bbq_code_layout::packed_1b || Layout == bbq_code_layout::packed_4b,
                 "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
   // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
   // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
   // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
   // promoted query works exactly like a promoted document.
-  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
+  constexpr int expansion       = Layout == bbq_code_layout::packed_1b ? 4 : 1;
   constexpr int native_tile     = TileBytes / expansion;
   constexpr int native_tile_u32 = native_tile / 4;
   constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
@@ -1279,8 +1277,8 @@ __device__ __forceinline__ void stage_neighbor_lists(Index_t* new_neighbors,
   old_size = old_size2.x + s_unique_counter[1];
 }
 
-template <bbq_layout DocumentLayout,
-          bbq_layout QueryLayout,
+template <bbq_code_layout DocumentLayout,
+          bbq_code_layout QueryLayout,
           bool SelfJoin,
           typename DataT,
           typename Index_t,
@@ -1694,8 +1692,8 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 // (8x8, the only shape nvcuda::wmma exposes for u4), each warp covers its region via a
 // SUB_PER_DIM x SUB_PER_DIM grid of native tiles instead of a single call -- SUB_PER_DIM is a
 // forced consequence of (MAX_NUM_BI_SAMPLES/MMA_M) / WARPS_PER_DIM, not an arbitrary choice.
-template <bbq_layout DocumentLayout,
-          bbq_layout QueryLayout,
+template <bbq_code_layout DocumentLayout,
+          bbq_code_layout QueryLayout,
           bool SelfJoin,
           typename DataT,
           typename Index_t,
@@ -2472,18 +2470,16 @@ void GNND<Data_t, Index_t>::local_join(
   cuvs::neighbors::device_bbq_dataset_view<std::remove_const_t<Data_t>, int64_t> dataset,
   DistEpilogue_t dist_epilogue)
 {
-  namespace bbq = cuvs::preprocessing::quantize::bbq;
-  using L       = bbq_layout;
   raft::matrix::fill(res, dists_buffer_.view(), std::numeric_limits<float>::max());
 
   // Both kernels take the same (document, query) pair, so there is no symmetric/asymmetric split
   // here: a single quantizer just means the same one on both operands, which is exactly what
   // SelfJoin encodes. Picking the two quantizers is all that differs.
   const bool self_join = dataset.quantizers.size() == 1;
-  const bool has_1b    = dataset.has_bit_and_layout(1, L::packed_1b);
-  const bool has_4b    = dataset.has_bit_and_layout(4, L::packed_4b);
-  const bool has_2bt   = dataset.has_bit_and_layout(2, L::transposed_2b);
-  const bool has_4bt   = dataset.has_bit_and_layout(4, L::transposed_4b);
+  const bool has_1b    = dataset.has_bit_and_layout(1, bbq_code_layout::packed_1b);
+  const bool has_4b    = dataset.has_bit_and_layout(4, bbq_code_layout::packed_4b);
+  const bool has_2bt   = dataset.has_bit_and_layout(2, bbq_code_layout::transposed_2b);
+  const bool has_4bt   = dataset.has_bit_and_layout(4, bbq_code_layout::transposed_4b);
 
   // Asymmetric: a packed_4b query selects the tensor-core path, a transposed query the SIMT one.
   // Only packed_1b promotes to the tensor-core path; transposed_2b is SIMT-only (it would need
@@ -2494,20 +2490,21 @@ void GNND<Data_t, Index_t>::local_join(
                "Unsupported BBQ layout pair for asymmetric local join. Supported: "
                "packed_1b x packed_4b (tensor core); packed_1b x transposed_2b, "
                "packed_1b x transposed_4b, transposed_2b x transposed_4b (SIMT).");
-  auto quantizer_query    = self_join
-                              ? dataset.quantizers[0]
-                              : (tc_pair ? dataset.get_quantizer(4, L::packed_4b)
-                                         : (has_4bt ? dataset.get_quantizer(4, L::transposed_4b)
-                                                    : dataset.get_quantizer(2, L::transposed_2b)));
+  auto quantizer_query =
+    self_join ? dataset.quantizers[0]
+              : (tc_pair ? dataset.get_quantizer(4, bbq_code_layout::packed_4b)
+                         : (has_4bt ? dataset.get_quantizer(4, bbq_code_layout::transposed_4b)
+                                    : dataset.get_quantizer(2, bbq_code_layout::transposed_2b)));
   auto quantizer_document = self_join ? dataset.quantizers[0]
-                            : has_1b  ? dataset.get_quantizer(1, L::packed_1b)
-                                      : dataset.get_quantizer(2, L::transposed_2b);
+                            : has_1b  ? dataset.get_quantizer(1, bbq_code_layout::packed_1b)
+                                      : dataset.get_quantizer(2, bbq_code_layout::transposed_2b);
 
   // stage_tile_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
   // must be 4-byte aligned.
   {
-    const auto len     = bbq::get_encoded_row_length(quantizer_query);
-    const int n_planes = bbq::get_code_planes(quantizer_query.layout);
+    const auto len = cuvs::preprocessing::quantize::bbq::get_encoded_row_length(quantizer_query);
+    const int n_planes =
+      cuvs::preprocessing::quantize::bbq::get_code_planes(quantizer_query.layout);
     RAFT_EXPECTS(len % (4u * static_cast<uint32_t>(n_planes)) == 0,
                  "BBQ local join requires the encoded row length to be a multiple of 4*n_planes "
                  "for 32-bit aligned plane loads, got %u with n_planes = %d",
@@ -2530,7 +2527,7 @@ void GNND<Data_t, Index_t>::local_join(
     d_list_sizes_old_.data_handle(), NUM_SAMPLES, quantizer_document, quantizer_query,           \
     graph_buffer_.data_handle(), dists_buffer_.data_handle(), DEGREE_ON_DEVICE,                  \
     d_locks_.data_handle(), build_config_.metric, dist_epilogue
-    if constexpr (Q == L::packed_4b) {
+    if constexpr (Q == bbq_code_layout::packed_4b) {
       local_join_kernel_bbq_wmma<D, Q, S>
         <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);
     } else {
@@ -2539,52 +2536,52 @@ void GNND<Data_t, Index_t>::local_join(
     }
 #undef CUVS_BBQ_LOCAL_JOIN_ARGS
   };
-  const L d = quantizer_document.layout;
-  const L q = quantizer_query.layout;
+  const bbq_code_layout d = quantizer_document.layout;
+  const bbq_code_layout q = quantizer_query.layout;
   if (self_join) {
     switch (d) {
-      case L::packed_1b:
-        launch(std::integral_constant<L, L::packed_1b>{},
-               std::integral_constant<L, L::packed_1b>{},
+      case bbq_code_layout::packed_1b:
+        launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_1b>{},
+               std::integral_constant<bbq_code_layout, bbq_code_layout::packed_1b>{},
                std::true_type{});
         break;
-      case L::transposed_2b:
-        launch(std::integral_constant<L, L::transposed_2b>{},
-               std::integral_constant<L, L::transposed_2b>{},
+      case bbq_code_layout::transposed_2b:
+        launch(std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_2b>{},
+               std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_2b>{},
                std::true_type{});
         break;
-      case L::packed_4b:
-        launch(std::integral_constant<L, L::packed_4b>{},
-               std::integral_constant<L, L::packed_4b>{},
+      case bbq_code_layout::packed_4b:
+        launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_4b>{},
+               std::integral_constant<bbq_code_layout, bbq_code_layout::packed_4b>{},
                std::true_type{});
         break;
-      case L::packed_7b:
-        launch(std::integral_constant<L, L::packed_7b>{},
-               std::integral_constant<L, L::packed_7b>{},
+      case bbq_code_layout::packed_7b:
+        launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_7b>{},
+               std::integral_constant<bbq_code_layout, bbq_code_layout::packed_7b>{},
                std::true_type{});
         break;
-      case L::packed_8b:
-        launch(std::integral_constant<L, L::packed_8b>{},
-               std::integral_constant<L, L::packed_8b>{},
+      case bbq_code_layout::packed_8b:
+        launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_8b>{},
+               std::integral_constant<bbq_code_layout, bbq_code_layout::packed_8b>{},
                std::true_type{});
         break;
       default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join on this branch.");
     }
-  } else if (d == L::packed_1b && q == L::packed_4b) {
-    launch(std::integral_constant<L, L::packed_1b>{},
-           std::integral_constant<L, L::packed_4b>{},
+  } else if (d == bbq_code_layout::packed_1b && q == bbq_code_layout::packed_4b) {
+    launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_1b>{},
+           std::integral_constant<bbq_code_layout, bbq_code_layout::packed_4b>{},
            std::false_type{});
-  } else if (d == L::packed_1b && q == L::transposed_2b) {
-    launch(std::integral_constant<L, L::packed_1b>{},
-           std::integral_constant<L, L::transposed_2b>{},
+  } else if (d == bbq_code_layout::packed_1b && q == bbq_code_layout::transposed_2b) {
+    launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_1b>{},
+           std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_2b>{},
            std::false_type{});
-  } else if (d == L::packed_1b && q == L::transposed_4b) {
-    launch(std::integral_constant<L, L::packed_1b>{},
-           std::integral_constant<L, L::transposed_4b>{},
+  } else if (d == bbq_code_layout::packed_1b && q == bbq_code_layout::transposed_4b) {
+    launch(std::integral_constant<bbq_code_layout, bbq_code_layout::packed_1b>{},
+           std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_4b>{},
            std::false_type{});
-  } else if (d == L::transposed_2b && q == L::transposed_4b) {
-    launch(std::integral_constant<L, L::transposed_2b>{},
-           std::integral_constant<L, L::transposed_4b>{},
+  } else if (d == bbq_code_layout::transposed_2b && q == bbq_code_layout::transposed_4b) {
+    launch(std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_2b>{},
+           std::integral_constant<bbq_code_layout, bbq_code_layout::transposed_4b>{},
            std::false_type{});
   } else {
     RAFT_FAIL("Unsupported BBQ layout pair for asymmetric local join.");
