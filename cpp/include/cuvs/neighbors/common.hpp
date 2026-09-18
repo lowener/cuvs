@@ -308,15 +308,6 @@ using standard_dataset_owning_storage =
 template <typename ViewT, typename DataT, typename IdxT>
 using standard_dataset_view_storage = dense_row_major_dataset_view_storage<ViewT, DataT, IdxT>;
 
-template <typename T, typename IdxT, typename Accessor>
-using dense_owning_vector = std::conditional_t<Accessor::is_device_accessible,
-                                               raft::device_vector<T, IdxT>,
-                                               raft::host_vector<T, IdxT>>;
-
-template <typename T, typename IdxT, typename Accessor>
-using dense_view_vector = std::conditional_t<Accessor::is_device_accessible,
-                                             raft::device_vector_view<T, IdxT>,
-                                             raft::host_vector_view<T, IdxT>>;
 // -----------------------------------------------------------------------------
 // VPQ compressed
 // -----------------------------------------------------------------------------

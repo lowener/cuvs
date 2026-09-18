@@ -2523,7 +2523,7 @@ auto build_from_device_matrix(raft::resources const& res,
 
 /**
  * Build from a device-resident BBQ-quantized dataset: the whole graph construction runs on the
- * compressed codes, so peak memory is driven by the code size rather than the original vectors.
+ * compressed codes.
  *
  * The returned index cannot be searched, because CAGRA has no BBQ search kernels. Pass an
  * uncompressed device-padded dataset to `cagra::update_dataset` to obtain a searchable index over

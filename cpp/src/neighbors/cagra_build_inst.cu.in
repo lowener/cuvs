@@ -101,7 +101,6 @@ auto build(raft::resources const& res,
   return cuvs::neighbors::cagra::build<inst_bbq_view_t>(res, params, dataset);
 }
 
-// Rebinding the uncompressed vectors is what makes a graph built from codes searchable.
 CUVS_INST_CAGRA_UPDATE_DATASET(data_t, index_t, inst_bbq_view_t, inst_device_padded_view_t);
 
 #undef CUVS_INST_CAGRA_UPDATE_DATASET

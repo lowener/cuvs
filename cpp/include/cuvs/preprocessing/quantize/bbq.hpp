@@ -218,20 +218,18 @@ template <typename DataT, typename IdxT>
 using device_bbq_quantizer_view = bbq_quantizer_view<DataT, IdxT>;
 
 namespace helpers {
-/** Derives dequant_delta from lower/upper_intervals and bits. */
-auto resolve_dequant_delta(
-  raft::resources& res,
-  const raft::device_mdarray<float, raft::vector_extent<int64_t>>& lower_intervals,
-  const raft::device_mdarray<float, raft::vector_extent<int64_t>>& upper_intervals,
-  uint32_t bits) -> raft::device_mdarray<float, raft::vector_extent<int64_t>>;
-
-/** Derives dequant_sum_delta from the already resolved dequant_delta and quantized_component_sums.
+/**
+ * Derives dequant_delta from lower/upper_intervals and bits, and dequant_sum_delta from that
+ * delta and quantized_component_sums.
  */
-auto resolve_dequant_sum_delta(
+void resolve_dequant_factors(
   raft::resources& res,
-  const raft::device_mdarray<float, raft::vector_extent<int64_t>>& dequant_delta,
-  const raft::device_mdarray<int32_t, raft::vector_extent<int64_t>>& quantized_component_sums)
-  -> raft::device_mdarray<float, raft::vector_extent<int64_t>>;
+  raft::device_vector_view<float, int64_t> dequant_delta,
+  raft::device_vector_view<float, int64_t> dequant_sum_delta,
+  raft::device_vector_view<const float, int64_t> lower_intervals,
+  raft::device_vector_view<const float, int64_t> upper_intervals,
+  raft::device_vector_view<const int32_t, int64_t> quantized_component_sums,
+  uint32_t bits);
 }  // namespace helpers
 /** @} */  // end of bbq group
 

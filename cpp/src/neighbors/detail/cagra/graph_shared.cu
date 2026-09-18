@@ -207,10 +207,6 @@ __global__ void kern_sort_bbq(const device_bbq_quantizer_view_t<DataT, int64_t> 
   float my_keys[numElementsPerThread];
   uint32_t my_vals[numElementsPerThread];
 
-  // One quantized distance is a whole-row popcount over packed codes, which does not decompose
-  // across lanes the way a dense dot product does. So each lane computes the distances for the
-  // neighbors it already owns in the bitonic register layout (element i of lane l holds neighbor
-  // i * WarpSize + l) instead of the warp cooperating on one neighbor at a time.
   for (int i = 0; i < numElementsPerThread; i++) {
     const uint32_t k = i * raft::WarpSize + lane_id;
     if (k >= graph_degree) {
@@ -219,8 +215,6 @@ __global__ void kern_sort_bbq(const device_bbq_quantizer_view_t<DataT, int64_t> 
       continue;
     }
     const uint32_t dst_node = knn_graph[k + static_cast<uint64_t>(graph_degree) * src_node];
-    // nn-descent scored the first endpoint of a pair with the document codes; keep that
-    // orientation so the sort ranks by the same distance that built these lists.
     my_keys[i] = bbq_row_distance(quantizer_document, quantizer_query, metric, src_node, dst_node);
     my_vals[i] = dst_node;
   }
@@ -328,14 +322,13 @@ void sort_knn_graph_bbq_impl(raft::resources const& res,
                quantizer_document.dim());
 
   const double time_sort_start = cur_time();
-  RAFT_LOG_DEBUG("# Sorting kNN Graph on GPUs ");
+  RAFT_LOG_DEBUG("# Sorting kNN Graph on GPUs\n");
 
   auto large_tmp_mr  = raft::resource::get_large_workspace_resource_ref(res);
   auto d_input_graph = raft::make_device_mdarray<uint32_t>(
     res, large_tmp_mr, raft::make_extents<int64_t>(graph_size, graph_degree));
   raft::copy(res, d_input_graph.view(), knn_graph);
 
-  RAFT_LOG_DEBUG(".");
   constexpr uint32_t block_size = 256;
   auto const warps              = block_size / raft::WarpSize;
   auto const blocks             = (graph_size + warps - 1) / warps;
@@ -348,9 +341,7 @@ void sort_knn_graph_bbq_impl(raft::resources const& res,
     metric);
   RAFT_CUDA_TRY(cudaGetLastError());
   raft::resource::sync_stream(res);
-  RAFT_LOG_DEBUG(".");
   raft::copy(res, knn_graph, raft::make_const_mdspan(d_input_graph.view()));
-  RAFT_LOG_DEBUG("\n");
 
   const double time_sort_end = cur_time();
   RAFT_LOG_DEBUG("# Sorting kNN graph time: %.1lf sec\n", time_sort_end - time_sort_start);
