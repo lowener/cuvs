@@ -285,41 +285,6 @@ __device__ __forceinline__ void load_vec(__half* vec_buffer,
   }
 }
 
-template <int n_planes>
-__device__ inline void load_vec_bbq_simt(uint32_t* vec_buffer,
-                                         const uint32_t* d_vec,
-                                         int plane_extent,
-                                         int num_load,
-                                         int plane_tile,
-                                         int lane_id)
-{
-  // Loads only [0, num_load) per plane. Callers are responsible for zeroing the padding
-  // [num_load, plane_tile) on the last tile (see the step == n_tiles - 1 branch at the
-  // call site) -- this keeps the load loop branch-free and minimizes live registers.
-  for (int idx = lane_id; idx < num_load; idx += raft::warp_size()) {
-#pragma unroll
-    for (int p = 0; p < n_planes; ++p) {
-      vec_buffer[p * plane_tile + idx] = d_vec[p * plane_extent + idx];
-    }
-  }
-}
-
-// Zero the per-plane padding [num_load, plane_tile) so the dot product's full-tile read sees
-// zeros beyond the real data. Called at the load site only when step == n_tiles - 1.
-template <int n_planes>
-__device__ inline void zero_pad_bbq_simt(uint32_t* vec_buffer,
-                                         int num_load,
-                                         int plane_tile,
-                                         int lane_id)
-{
-  for (int idx = num_load + lane_id; idx < plane_tile; idx += raft::warp_size()) {
-#pragma unroll
-    for (int p = 0; p < n_planes; ++p) {
-      vec_buffer[p * plane_tile + idx] = 0;
-    }
-  }
-}
-
 /** One warp per block. Computes squared L2 norm for each row. */
 template <typename Data_t>
 RAFT_KERNEL compute_l2_norms_kernel(const Data_t* data, int dim, DistData_t* l2_norms)
@@ -1172,13 +1137,13 @@ __launch_bounds__(BLOCK_SIZE)
 using cuvs::preprocessing::quantize::bbq::bbq_calculate_metric;
 using cuvs::preprocessing::quantize::bbq::bbq_dequant_factors;
 using cuvs::preprocessing::quantize::bbq::get_dequant_factors;
-using cuvs::preprocessing::quantize::bbq::promote_packed_1b_word_to_4b;
-using cuvs::preprocessing::quantize::bbq::promote_word_to_4b;
+using cuvs::preprocessing::quantize::bbq::packed_1b_to_4b;
 
-// Stages one tile of `count` rows into a SIMT shared-memory buffer, zero-padding a short last
-// tile. The SIMT counterpart of stage_promoted_tile: it folds the same warp-strided row loop,
-// per-plane load and tail zero-fill into one call, so the four staging sites in the SIMT kernel
-// read like the wmma kernel's.
+// Stages one K-tile of `count` neighbor rows into SMEM. Shared skeleton: one warp per row,
+// lanes strided along native uint32 words, last-tile zero-pad so compute reads a full tile.
+//
+// stage_tile_simt copies native codes in storage layout (Planes > 1 gathers bit-sliced planes).
+// stage_promoted_tile expands packed_1b to u4 for int4 MMA (packed_4b is a plain copy).
 template <int Planes, int RowStride, typename DataT, typename Index_t>
 __device__ __forceinline__ void stage_tile_simt(
   uint8_t (*dst)[RowStride],
@@ -1197,15 +1162,80 @@ __device__ __forceinline__ void stage_tile_simt(
   for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
     const int idx = i * num_warps + warp_id;
     if (idx >= count) continue;
-    auto* s = reinterpret_cast<uint32_t*>(dst[idx]);
-    load_vec_bbq_simt<Planes>(
-      s,
-      reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base)),
-      plane_extent,
-      num_load_u32,
-      plane_tile_u32,
-      lane_id);
-    if (last_tile) { zero_pad_bbq_simt<Planes>(s, num_load_u32, plane_tile_u32, lane_id); }
+    auto* s         = reinterpret_cast<uint32_t*>(dst[idx]);
+    const auto* src = reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base));
+    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
+#pragma unroll
+      for (int p = 0; p < Planes; ++p) {
+        s[p * plane_tile_u32 + w] = src[p * plane_extent + w];
+      }
+    }
+    if (last_tile) {
+      for (int w = num_load_u32 + lane_id; w < plane_tile_u32; w += raft::warp_size()) {
+#pragma unroll
+        for (int p = 0; p < Planes; ++p) {
+          s[p * plane_tile_u32 + w] = 0;
+        }
+      }
+    }
+  }
+}
+
+// `native_row_bytes` is the layout's own encoded row length. One native tile is
+// RowStride-independent: BBQ_ROW_BYTES / expansion native bytes promote to exactly BBQ_ROW_BYTES
+// promoted bytes, so a single n_tiles drives every operand regardless of how compact each one's
+// on-disk format is.
+template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
+__device__ __forceinline__ void stage_promoted_tile(
+  uint8_t (*dst)[RowStride],
+  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
+  const Index_t* neighbors,
+  const int count,
+  const int step,
+  const int native_row_bytes,
+  const int warp_id,
+  const int lane_id)
+{
+  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
+                "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
+  // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
+  // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
+  // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
+  // promoted query works exactly like a promoted document.
+  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
+  constexpr int native_tile     = TileBytes / expansion;
+  constexpr int native_tile_u32 = native_tile / 4;
+  constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
+  // packed_4b's native tile is 32 u32s (one per lane). packed_1b's is 8, so a warp-per-row
+  // map would leave 24 lanes idle; instead pack warp_size/8 = 4 rows into one pass.
+  static_assert(raft::warp_size() % native_tile_u32 == 0);
+  constexpr int rows_per_pass = raft::warp_size() / native_tile_u32;
+  static_assert(MAX_NUM_BI_SAMPLES % (num_warps * rows_per_pass) == 0);
+
+  const int base      = step * native_tile;
+  const int remaining = native_row_bytes - base;
+  const int num_load_u32 =
+    (remaining < native_tile ? (remaining > 0 ? remaining : 0) : native_tile) / 4;
+
+  for (int i = 0; i < MAX_NUM_BI_SAMPLES / (num_warps * rows_per_pass); ++i) {
+    const int idx = (i * num_warps + warp_id) * rows_per_pass + lane_id / native_tile_u32;
+    const int w   = lane_id % native_tile_u32;
+    if (idx >= count) continue;
+    auto* s         = reinterpret_cast<uint32_t*>(dst[idx]);
+    const auto* src = reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], base));
+    if (w < num_load_u32) {
+      if constexpr (expansion == 4) {
+        reinterpret_cast<uint4*>(s)[w] = packed_1b_to_4b(src[w]);
+      } else {
+        s[w] = src[w];
+      }
+    } else {
+      if constexpr (expansion == 4) {
+        reinterpret_cast<uint4*>(s)[w] = uint4{0, 0, 0, 0};
+      } else {
+        s[w] = 0;
+      }
+    }
   }
 }
 
@@ -1305,24 +1335,14 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     s_doc_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES / query_planes * document_planes + DOC_PAD];
   __shared__ __align__(alignof(uint32_t))
     uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES + BBQ_PAD];
-  // Holds the final (post-metric, post-epilogue) float distance per cell -- computed once, inline,
-  // right when a cell's raw dot product is ready (see the store loops below), instead of the raw
-  // u32 dot product get_min_item_fused used to convert lazily, per read. That removes the need for
-  // get_min_item_fused entirely: both sweeps below read finished floats via the plain
-  // get_min_item, same as the dense/SIMT kernels.
+  // Holds the final (post-metric, post-epilogue) float distance per cell
   __shared__ DistData_t s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
   __shared__ int s_unique_counter[2];
   // Document-side (row axis) dequant factors, indexed by list position -- shared by both phases
   // below since rows are always the `new_neighbors`/document side in both, so this is staged once
   // and never restaged. At a given accumulation step, up to MAX_NUM_BI_SAMPLES threads share the
   // same row0 (see the pair_idx assignment below), so caching avoids up to 64x redundant scattered
-  // global reads -- same magnitude problem the old get_min_item_fused design solved with
-  // s_varying_factors, just triggered by the store loop's thread/cell mapping instead of by
-  // repeated min-search reads. The column/query side doesn't need a shared array: pair_idx's
-  // assignment makes `col` invariant across a single thread's own iterations (BLOCK_SIZE is a
-  // multiple of MAX_NUM_BI_SAMPLES), so each thread fetches its own column's factors once,
-  // directly into a register -- only ~8x redundant across the threads sharing that column, not
-  // worth a barrier/array for.
+  // global reads
   __shared__ bbq_dequant_factors s_document_factors[MAX_NUM_BI_SAMPLES];
 
   if (threadIdx.x == 0) {
@@ -1395,22 +1415,14 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   constexpr int plane_tile_u32       = plane_tile / 4;
   constexpr int query_plane_tile_u32 = query_plane_tile / 4;
   const int n_tiles                  = raft::ceildiv(plane_bytes, plane_tile);
-  // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles row-pair
-  // boundaries. SKEWED is only for the distance matrix layout. Shared by both phases below: thread
-  // tx owns the same pair_idx set on every step of either phase's loop (the assignment doesn't
-  // depend on step), so a per-thread register accumulator can persist across the whole n_tiles
-  // loop and get converted to a final float distance exactly once at the end -- mirroring the wmma
-  // kernel's fragment accumulator, instead of a read-modify-write into SMEM every step.
+
+  // with NUM_SAMPLES=32, BLOCK_SIZE=256, pairs_per_thread = 32 * 64 / 512 = 4
   constexpr int num_row_pairs    = MAX_NUM_BI_SAMPLES / 2;
   constexpr int num_pairs        = num_row_pairs * MAX_NUM_BI_SAMPLES;
   constexpr int pairs_per_thread = (num_pairs + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-  // Every thread's column is invariant across its pairs_per_thread iterations (BLOCK_SIZE is a
-  // multiple of MAX_NUM_BI_SAMPLES, see s_document_factors' comment above), so fetch it once here
-  // and reuse the register copy in both phases' store loops below instead of a shared array.
-  // row_norm isn't cached here (unlike lower/delta/sum_delta/corrections): it's read fresh from
-  // dataset_query inside bbq_calculate_metric instead -- register pressure is already tight in
-  // this kernel, and row_norm is only needed for the less common CosineExpanded metric.
+  // Every thread's column is invariant across its pairs_per_thread iterations, so fetch it once
+  // here and reuse the register copy in both phases' store loops below instead of a shared array.
   const int my_col = tx % MAX_NUM_BI_SAMPLES;
   bbq_dequant_factors my_col_factors{};
   if (my_col < new_size) {
@@ -1435,14 +1447,12 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                               last_tile,
                                                               warp_id,
                                                               lane_id);
-    __syncthreads();
 
     // Query and document tiles cover the same dimension range per step (both tile at
     // query_plane_tile), so load the query tile once and run the dot product directly -- no
     // per-step query sub-tile loop. Under SelfJoin phase 1 is new x new on a single quantizer,
     // so the document buffer already holds exactly what the query buffer would: skip the load
-    // and point the B operand at s_doc_vec. This is the SIMT twin of the wmma kernel's phase-1
-    // buffer alias, and halves this phase's staging traffic.
+    // and point the B operand at s_doc_vec.
     if constexpr (!SelfJoin) {
       stage_tile_simt<query_planes, QUERY_ROW_BYTES + BBQ_PAD>(s_query_vec,
                                                                dataset_query,
@@ -1455,8 +1465,8 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                                last_tile,
                                                                warp_id,
                                                                lane_id);
-      __syncthreads();
     }
+    __syncthreads();
 
 #pragma unroll
     for (int k = 0; k < pairs_per_thread; ++k) {
@@ -1465,30 +1475,20 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
       if (col >= new_size) continue;
-      uint32_t total0 = 0;
-      uint32_t total1 = 0;
       // Phase 1 B operand: s_doc_vec under SelfJoin (see the staging note above).
+      const uint8_t* row_b;
       if constexpr (SelfJoin) {
-        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                       QueryLayout,
-                                                                       SelfJoin,
-                                                                       document_planes,
-                                                                       query_planes,
-                                                                       doc_row_bytes,
-                                                                       QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_doc_vec[col], total0, total1);
+        row_b = s_doc_vec[col];
       } else {
-        cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
-                                                                       QueryLayout,
-                                                                       SelfJoin,
-                                                                       document_planes,
-                                                                       query_planes,
-                                                                       doc_row_bytes,
-                                                                       QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
+        row_b = s_query_vec[col];
       }
-      acc0[k] += total0;
-      acc1[k] += total1;
+      cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
+                                                                     QueryLayout,
+                                                                     document_planes,
+                                                                     query_planes,
+                                                                     doc_row_bytes,
+                                                                     QUERY_ROW_BYTES>(
+        s_doc_vec[row0], s_doc_vec[row0 + 1], row_b, acc0[k], acc1[k]);
     }
     __syncthreads();
   }
@@ -1579,7 +1579,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                                                 last_tile,
                                                                 warp_id,
                                                                 lane_id);
-      __syncthreads();
     }
     stage_tile_simt<query_planes, QUERY_ROW_BYTES + BBQ_PAD>(s_query_vec,
                                                              dataset_query,
@@ -1601,18 +1600,13 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
       const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
       if (col >= old_size) continue;
-      uint32_t total0 = 0;
-      uint32_t total1 = 0;
       cuvs::preprocessing::quantize::bbq::bbq_code_inner_product_2x1<DocumentLayout,
                                                                      QueryLayout,
-                                                                     SelfJoin,
                                                                      document_planes,
                                                                      query_planes,
                                                                      doc_row_bytes,
                                                                      QUERY_ROW_BYTES>(
-        s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
-      acc0_old[k] += total0;
-      acc1_old[k] += total1;
+        s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], acc0_old[k], acc1_old[k]);
     }
     __syncthreads();
   }
@@ -1670,9 +1664,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     }
   }
 
-  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
-  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
-  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
@@ -1690,81 +1681,11 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   }
 }
 
-// Stages one K-tile of `count` rows from `quantizer` into a 4-bit-width SMEM buffer, promoting
-// each native word via promote_word_to_4b<Layout>. One warp per row (rows strided by
-// num_warps), lanes strided across the row's native words; the tail past the row's end is zeroed
-// so the MMA sees defined data. `native_row_bytes` is the layout's own encoded row length, and
-// one native tile is RowStride-independent: BBQ_ROW_BYTES / expansion native bytes promote to
-// exactly BBQ_ROW_BYTES promoted bytes, so a single n_tiles drives every operand regardless of
-// how compact each one's on-disk format is.
-template <bbq_layout Layout, int TileBytes, int RowStride, typename DataT, typename Index_t>
-__device__ __forceinline__ void stage_promoted_tile(
-  uint8_t (*dst)[RowStride],
-  const device_bbq_quantizer_view<DataT, int64_t>& quantizer,
-  const Index_t* neighbors,
-  const int count,
-  const int step,
-  const int native_row_bytes,
-  const int warp_id,
-  const int lane_id)
-{
-  static_assert(Layout == bbq_layout::packed_1b || Layout == bbq_layout::packed_4b,
-                "int4 MMA path supports packed_1b (1b), packed_4b (4b)");
-  // A u4 MMA fragment needs 4 bits per value, so a layout storing `bits` bits per value expands
-  // one native word into 4/bits promoted words. packed_4b is the identity case (a plain word
-  // copy), which is why the symmetric kernel needs no separate "no promotion" path -- and why a
-  // promoted query works exactly like a promoted document.
-  constexpr int expansion       = Layout == bbq_layout::packed_1b ? 4 : 1;
-  constexpr int native_tile     = TileBytes / expansion;
-  constexpr int native_tile_u32 = native_tile / 4;
-  constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
-
-  const int native_base = step * native_tile;
-  const int remaining   = native_row_bytes - native_base;
-  const int num_load_u32 =
-    (remaining < native_tile ? (remaining > 0 ? remaining : 0) : native_tile) / 4;
-
-  for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-    const int idx = i * num_warps + warp_id;
-    if (idx >= count) continue;
-    auto* s_u32 = reinterpret_cast<uint32_t*>(dst[idx]);
-    const uint32_t* src =
-      reinterpret_cast<const uint32_t*>(&quantizer.codes(neighbors[idx], native_base));
-    for (int w = lane_id; w < num_load_u32; w += raft::warp_size()) {
-      uint32_t out[expansion];
-      promote_word_to_4b<Layout>(src[w], out);
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s_u32[expansion * w + e] = out[e];
-      }
-    }
-    // No-op unless this is the last tile and the row doesn't fill it.
-    for (int w = num_load_u32 + lane_id; w < native_tile_u32; w += raft::warp_size()) {
-#pragma unroll
-      for (int e = 0; e < expansion; ++e) {
-        s_u32[expansion * w + e] = 0;
-      }
-    }
-  }
-}
-
 // int4 tensor-core BBQ local join, covering both the symmetric (one quantizer, self-join) and
 // asymmetric (two quantizers) cases. Modeled on local_join_kernel_wmma: nvcuda::wmma fragments
 // (u4 x u4 -> s32, shape m8n8k32) replace the popc/dp4a inner product; the accumulator lives in
 // registers across the whole K reduction and is stored to s_distances once per (row-tile,
-// col-tile), not accumulated into shared memory every step like the scalar kernel. That raw store
-// is then converted to final float distances in place -- see run_phase's conversion loop and
-// bbq_calculate_metric.
-//
-// The two cases differ in exactly three places, all compile-time:
-//   * DocumentLayout / QueryLayout -- each operand is promoted to 4-bit width by
-//     stage_promoted_tile, and packed_4b is the identity case, so "no promotion" is not a
-//     separate code path. packed_1b is the only promotable document layout (4x4, 1x4 by dispatch
-//     alone); transposed_2b never reaches this kernel.
-//   * SelfJoin -- when both operands are the same quantizer, phase 1 (new x new) stages one
-//     buffer and feeds it to both fragments, halving that phase's SMEM writes. Asymmetric can
-//     never do this: document and query are two distinct quantized representations of the same
-//     rows, so aliasing them would compute doc.doc, a different (worse) estimator.
+// col-tile), not accumulated into shared memory every step like the scalar kernel.
 //
 // Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
 // grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
@@ -1848,10 +1769,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   __shared__ __align__(16) uint8_t s_row_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + MMA_PAD];
   // s_col_vec aliases s_distances's memory instead of its own array: their live ranges never
   // overlap (col_vec fully consumed by the kk-loop before distances are stored; distances fully
-  // consumed by the min-search loop before the next phase re-stages col_vec). Same pattern as
-  // local_join_kernel_wmma's s_distances/s_ov aliasing. store_matrix_sync below writes raw int
-  // accumulator values into this same memory (reinterpreted as int*); the conversion loop right
-  // after it turns those into final DistData_t floats in place -- see bbq_calculate_metric.
+  // consumed by the min-search loop before the next phase re-stages col_vec).
   __shared__ __align__(16) DistData_t s_distances[MAX_NUM_BI_SAMPLES * MMA_STORE_STRIDE];
   static_assert(sizeof(s_distances) >= MAX_NUM_BI_SAMPLES * (BBQ_ROW_BYTES + MMA_PAD),
                 "s_col_vec aliases s_distances's memory and must fit inside it");
@@ -2019,9 +1937,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       }
 
       // Cell (row, col) is read (as raw int, via this alias) and written (as the final float) at
-      // the same address by the same thread, so no cell is ever touched by more than one thread --
-      // no intra-loop synchronization needed, just the barrier below before any thread reads
-      // another thread's cell via get_min_item.
+      // the same address by the same thread
       auto* raw_view            = reinterpret_cast<int*>(s_distances);
       constexpr int total_cells = MAX_NUM_BI_SAMPLES * MAX_NUM_BI_SAMPLES;
       for (int i = tx; i < total_cells; i += BLOCK_SIZE) {
@@ -2052,10 +1968,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   }
   __syncthreads();
 
-  // list_idx indexes s_list (which id this row belongs to); idx_in_list is the row's position in
-  // the distance matrix. They differ in phase 2's second branch, where the id comes from the
-  // old-neighbour half of s_list but the matrix position is relative to the new half.
-
   // ---- Phase 1: new x new ----
   run_phase(new_neighbors, new_size, std::integral_constant<bool, SelfJoin>{}, false);
 
@@ -2080,9 +1992,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   // ---- Phase 2: new x old ----
   run_phase(old_neighbors, old_size, std::false_type{}, n_tiles == 1);
 
-  // Split from one combined [0, 2*MAX_NUM_BI_SAMPLES) loop into two: MAX_NUM_BI_SAMPLES is evenly
-  // divisible by num_warps (64/16), so this costs no extra steps, and it turns the old
-  // branch-per-half + double bounds-guard into one guard per loop, each new_size/old_size sized.
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
@@ -2098,9 +2007,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     }
   }
 
-  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
-  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
-  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
@@ -2152,6 +2058,63 @@ int insert_to_ordered_list(InternalID_t<Index_t>* list,
   dist_list[idx_insert] = dist;
   return idx_insert;
 };
+
+// Copies `h_graph` (stride `in_degree`) into `out` (stride `out_degree`), dropping self-edges and
+// repeated ids, then pads each short list with distinct random ids.
+//
+// The device-side lists can hold the same id twice: insert_to_global_graph only rejects an
+// incoming element when it compares equal to its immediate sorted neighbours, which misses a
+// second copy that arrived with a different distance.
+template <typename Index_t>
+void shrink_graph_removing_duplicates(Index_t* out,
+                                      const InternalID_t<Index_t>* h_graph,
+                                      const size_t nrow,
+                                      const size_t in_degree,
+                                      const size_t out_degree)
+{
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow; i++) {
+    auto* output_neighbor_list_ptr = out + i * out_degree;
+
+    size_t out_j = 0;
+    for (size_t in_j = 0; in_j < out_degree; in_j++) {
+      size_t idx = h_graph[i * in_degree + in_j].id();
+      // Unfilled slots carry a sentinel id; leave them to the random fill below.
+      if (idx >= nrow) { continue; }
+
+      bool dup = false;
+      for (size_t exi_j = 0; exi_j < out_j; exi_j++) {
+        if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        output_neighbor_list_ptr[out_j] = idx;
+        out_j++;
+      }
+    }
+
+    // Fill with random nodes if the length of the filled neighbor list is less than the degree.
+    for (size_t j = out_j; j < out_degree; j++) {
+      uint64_t rnd = static_cast<uint64_t>(i * out_degree + j + 1);
+      uint64_t idx;
+      bool dup = true;
+      for (size_t attempts = 0; dup && attempts < out_degree; attempts++) {
+        rnd = cuvs::neighbors::detail::device::xorshift64(rnd);
+        idx = rnd % nrow;
+        dup = false;
+        for (size_t exi_j = 0; exi_j < j; exi_j++) {
+          if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
+            dup = true;
+            break;
+          }
+        }
+      }
+      output_neighbor_list_ptr[j] = static_cast<Index_t>(idx);
+    }
+  }
+}
 
 }  // namespace
 
@@ -2540,7 +2503,7 @@ void GNND<Data_t, Index_t>::local_join(
                             : has_1b  ? dataset.get_quantizer(1, L::packed_1b)
                                       : dataset.get_quantizer(2, L::transposed_2b);
 
-  // load_vec_bbq_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
+  // stage_tile_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
   // must be 4-byte aligned.
   {
     const auto len     = bbq::get_encoded_row_length(quantizer_query);
@@ -2859,49 +2822,8 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
 
   Index_t* graph_shrink_buffer = (Index_t*)graph_.h_dists.data_handle();
 
-  // Copy the output graph while removing duplicates.
-#pragma omp parallel for
-  for (size_t i = 0; i < (size_t)nrow_; i++) {
-    auto output_neighbor_list_ptr = graph_shrink_buffer + i * build_config_.node_degree;
-
-    size_t out_j = 0;
-
-    // Copy neighbor list while removing duplicates.
-    for (size_t in_j = 0; in_j < build_config_.node_degree; in_j++) {
-      size_t idx = graph_.h_graph[i * graph_.node_degree + in_j].id();
-
-      bool dup = false;
-      for (size_t exi_j = 0; exi_j < out_j; exi_j++) {
-        if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
-          dup = true;
-          break;
-        }
-      }
-      if (!dup) {
-        output_neighbor_list_ptr[out_j] = idx;
-        out_j++;
-      }
-    }
-
-    // Fill with random nodes if the length of the filled neighbor list is less than the degree.
-    for (size_t j = out_j; j < build_config_.node_degree; j++) {
-      uint64_t rnd = static_cast<uint64_t>(i * build_config_.node_degree + j + 1);
-      uint64_t idx;
-      bool dup = true;
-      for (size_t attempts = 0; dup && attempts < build_config_.node_degree; attempts++) {
-        rnd = cuvs::neighbors::detail::device::xorshift64(rnd);
-        idx = rnd % nrow_;
-        dup = false;
-        for (size_t exi_j = 0; exi_j < j; exi_j++) {
-          if (static_cast<decltype(idx)>(output_neighbor_list_ptr[exi_j]) == idx || i == idx) {
-            dup = true;
-            break;
-          }
-        }
-      }
-      output_neighbor_list_ptr[j] = static_cast<int>(idx);
-    }
-  }
+  shrink_graph_removing_duplicates(
+    graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
   graph_.h_graph = nullptr;
 
 #pragma omp parallel for
@@ -3019,16 +2941,9 @@ void GNND<Data_t, Index_t>::build(
   }
 
   auto* graph_shrink_buffer = reinterpret_cast<Index_t*>(graph_.h_dists.data_handle());
-#pragma omp parallel for
-  for (size_t i = 0; i < nrow_; ++i) {
-    for (size_t j = 0; j < build_config_.node_degree; ++j) {
-      const size_t index = i * graph_.node_degree + j;
-      const int id       = graph_.h_graph[index].id();
-      graph_shrink_buffer[i * build_config_.node_degree + j] =
-        id < static_cast<int>(nrow_) ? id
-                                     : cuvs::neighbors::detail::device::xorshift64(index) % nrow_;
-    }
-  }
+
+  shrink_graph_removing_duplicates(
+    graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
   graph_.h_graph = nullptr;
 
 #pragma omp parallel for

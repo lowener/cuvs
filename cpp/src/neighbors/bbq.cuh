@@ -198,42 +198,25 @@ __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
 
 // Promotes one native word of dense packed_1b codes (1 bit/value, 8 values/byte, MSB-first:
 // the value at position 8*byte+i sits at bit (7-i)) into four 4-bit-width, packed_4b-style
-// output words.
+// output words, packed into one uint4 for a single vectorized store.
 //
 // Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise across all 4 native
-// bytes at once (field[j]'s byte i = field j of native byte i), spread each field 0-3 into a
-// nibble value lane-wise, then transpose the 4 resulting field-words into the 4 per-native-byte
-// output words with chained __byte_perm pairs (16 bits at a time, since one __byte_perm call
-// only reaches 2 of the 4 field-words). Equivalence with the straightforward
-// per-byte-extraction version verified exhaustively over random 32-bit inputs.
-__device__ __forceinline__ void promote_packed_1b_word_to_4b(uint32_t native_word, uint32_t out[4])
+// bytes at once, spread each field 0-3 into a nibble value lane-wise, then transpose the 4
+// resulting field-words into the 4 per-native-byte output words with chained __byte_perm pairs.
+__device__ __forceinline__ uint4 packed_1b_to_4b(uint32_t native_word)
 {
-  uint32_t spread[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const uint32_t field = (native_word >> (6 - 2 * j)) & 0x03030303u;
-    spread[j]            = ((field & 0x02020202u) << 3) | (field & 0x01010101u);
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    // sel picks: out byte0 = spread[.]'s byte i (source index i), out byte1 = spread[.]'s byte
-    // i (source index 4+i, i.e. the second byte_perm operand); byte2/3 are don't-care (masked
-    // off below).
-    const uint32_t sel = 0x00000040u + i * 0x00000011u;
-    const uint32_t lo  = __byte_perm(spread[0], spread[1], sel);
-    const uint32_t hi  = __byte_perm(spread[2], spread[3], sel);
-    out[i]             = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
-  }
-}
-
-template <bbq_code_layout Layout>
-__device__ __forceinline__ void promote_word_to_4b(uint32_t native_word, uint32_t* out)
-{
-  if constexpr (Layout == bbq_code_layout::packed_1b) {
-    promote_packed_1b_word_to_4b(native_word, out);
-  } else {
-    out[0] = native_word;  // packed_4b: already 4-bit-width
-  }
+  const uint32_t spread0 = ((native_word >> 3) & 0x10101010u) | ((native_word >> 6) & 0x01010101u);
+  const uint32_t spread1 = ((native_word >> 1) & 0x10101010u) | ((native_word >> 4) & 0x01010101u);
+  const uint32_t spread2 = ((native_word << 1) & 0x10101010u) | ((native_word >> 2) & 0x01010101u);
+  const uint32_t spread3 = ((native_word << 3) & 0x10101010u) | (native_word & 0x01010101u);
+  const uint32_t t0      = __byte_perm(spread0, spread1, 0x5140);
+  const uint32_t t1      = __byte_perm(spread0, spread1, 0x7362);
+  const uint32_t t2      = __byte_perm(spread2, spread3, 0x5140);
+  const uint32_t t3      = __byte_perm(spread2, spread3, 0x7362);
+  return uint4{__byte_perm(t0, t2, 0x5410),
+               __byte_perm(t0, t2, 0x7632),
+               __byte_perm(t1, t3, 0x5410),
+               __byte_perm(t1, t3, 0x7632)};
 }
 
 // --------------------------------------------------------------------------
@@ -284,7 +267,7 @@ __device__ __forceinline__ uint32_t code_inner_product_planes(const uint8_t* row
  * native word at a time -- 32 dimensions, which is exactly the four query words covering the same
  * range -- and the pair is multiplied as two packed_4b rows. The SIMT equivalent of what
  * stage_promoted_tile plus the u4 MMA do for this layout pair in the tensor-core local join, and
- * it pairs codes the same way, since promote_packed_1b_word_to_4b emits packed_4b-style words.
+ * it pairs codes the same way, since packed_1b_to_4b emits packed_4b-style words.
  *
  * Requires dim % 32 == 0, so that the promoted document covers the query row exactly.
  */
@@ -296,7 +279,8 @@ __device__ __forceinline__ uint32_t code_inner_product_1b_x_packed_4b(const uint
   assert(document_bytes % sizeof(uint32_t) == 0);
   for (size_t i = 0; i + sizeof(uint32_t) <= document_bytes; i += sizeof(uint32_t)) {
     uint32_t promoted[4];
-    promote_packed_1b_word_to_4b(*reinterpret_cast<const uint32_t*>(row_document + i), promoted);
+    reinterpret_cast<uint4&>(promoted) =
+      packed_1b_to_4b(*reinterpret_cast<const uint32_t*>(row_document + i));
     const auto* query_words = reinterpret_cast<const uint32_t*>(row_query + 4 * i);
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
@@ -436,13 +420,12 @@ __device__ inline void code_inner_product_packed_8b_2x1(const uint8_t* row_a0,
 }
 
 // Selects the SIMT inner product for a (document, query) layout pair: bit-sliced layouts go to the
-// cross-plane popc, densely-packed ones to dp4a. The dp4a forms are self-join only, since dp4a
-// needs both operands in the same packing. packed_7b and packed_8b reach this from
+// cross-plane popc, densely-packed ones to dp4a. dp4a needs both operands in the same packing, so
+// those forms apply whenever the two layouts match. packed_7b and packed_8b reach this from
 // GNND::local_join; packed_4b does not (symmetric packed_4b goes to the wmma kernel), but is kept
 // as a SIMT reference point.
 template <bbq_code_layout DocumentLayout,
           bbq_code_layout QueryLayout,
-          bool SelfJoin,
           int DocumentPlanes,
           int QueryPlanes,
           size_t DocumentRowBytes,
@@ -454,11 +437,12 @@ __device__ __forceinline__ void bbq_code_inner_product_2x1(const uint8_t* row_a0
                                                            uint32_t& total1)
 {
   namespace bbq = cuvs::preprocessing::quantize::bbq;
-  if constexpr (SelfJoin && DocumentLayout == bbq_code_layout::packed_4b) {
+  if constexpr (DocumentLayout == QueryLayout && DocumentLayout == bbq_code_layout::packed_4b) {
     bbq::code_inner_product_packed_4b_symmetric_2x1<DocumentRowBytes>(
       row_a0, row_a1, row_b, total0, total1);
-  } else if constexpr (SelfJoin && (DocumentLayout == bbq_code_layout::packed_8b ||
-                                    DocumentLayout == bbq_code_layout::packed_7b)) {
+  } else if constexpr (DocumentLayout == QueryLayout &&
+                       (DocumentLayout == bbq_code_layout::packed_8b ||
+                        DocumentLayout == bbq_code_layout::packed_7b)) {
     // packed_7b is packed_8b with the top bit masked off, matching code_inner_product's
     // (1 << bits) - 1 mask for the same two layouts.
     constexpr uint8_t code_mask = DocumentLayout == bbq_code_layout::packed_7b ? 0x7Fu : 0xFFu;

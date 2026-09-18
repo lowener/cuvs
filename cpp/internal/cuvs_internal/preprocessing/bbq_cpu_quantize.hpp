@@ -428,10 +428,10 @@ struct bbq_layout_token {
 // Same convention as my_tests/bbq's CLI tokens: bare N = densely packed (tensor-core-eligible),
 // N + "t" = transposed/bitplane (SIMT). At 1 bit the two coincide, so there is no "1t". There is
 // no densely-packed 2-bit layout at all (packed_2b was retired): transposed_2b is SIMT-only, so
-// "2" is the only 2-bit token and it is not tensor-core-eligible.
+// "2t" is the only 2-bit token and it is not tensor-core-eligible.
 constexpr bbq_layout_token kBbqLayoutTokens[] = {
   {"1", bbq_code_layout::packed_1b},
-  {"2", bbq_code_layout::transposed_2b},
+  {"2t", bbq_code_layout::transposed_2b},
   {"4", bbq_code_layout::packed_4b},
   {"4t", bbq_code_layout::transposed_4b},
   {"7", bbq_code_layout::packed_7b},
@@ -444,7 +444,7 @@ inline auto parse_bbq_layout_token(std::string_view token) -> bbq_code_layout
   for (const auto& t : kBbqLayoutTokens) {
     if (t.token == token) { return t.layout; }
   }
-  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2, 4, 4t, 7, 8.",
+  RAFT_FAIL("Unknown BBQ layout token '%s'; expected one of 1, 2t, 4, 4t, 7, 8.",
             std::string(token).c_str());
 }
 
