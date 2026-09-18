@@ -2608,7 +2608,7 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
       "Data type needs to be int8 or uint8 for NN Descent to run with BitwiseHamming distance.");
   }
 
-  cudaStream_t stream = raft::resource::get_cuda_stream(res);
+  cudaStream_t stream = raft::resource::get_cuda_stream(res).get();
   nrow_               = nrow;
   graph_.nrow         = nrow;
   graph_.bloom_filter.set_nrow(nrow);
@@ -2822,8 +2822,60 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
 
   Index_t* graph_shrink_buffer = (Index_t*)graph_.h_dists.data_handle();
 
-  shrink_graph_removing_duplicates(
-    graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
+  // Copy the output graph while removing duplicates. Each thread keeps a bit-packed "seen"
+  // array, one bit per dataset row, to test and mark ids in O(1) as it scans a row's
+  // candidates. Only the ids actually placed for a row are ever set, and they're cleared again
+  // immediately after that row is done, so beyond the one-time zero-initialization when each
+  // thread starts, no reset across the full array is ever needed.
+  const size_t num_dedup_words = (static_cast<size_t>(nrow_) + 63) / 64;
+#pragma omp parallel
+  {
+    std::vector<uint64_t> seen_bits(num_dedup_words, 0);
+
+    auto test_and_set = [&](size_t idx) -> bool {
+      uint64_t mask = uint64_t{1} << (idx & 63);
+      if (seen_bits[idx >> 6] & mask) { return false; }
+      seen_bits[idx >> 6] |= mask;
+      return true;
+    };
+
+#pragma omp for
+    for (size_t i = 0; i < (size_t)nrow_; i++) {
+      auto output_neighbor_list_ptr = graph_shrink_buffer + i * build_config_.node_degree;
+
+      size_t out_j = 0;
+
+      // Copy neighbor list while removing duplicates.
+      for (size_t in_j = 0; in_j < build_config_.node_degree; in_j++) {
+        size_t idx = graph_.h_graph[i * graph_.node_degree + in_j].id();
+        if (idx >= (size_t)nrow_ || idx == i || !test_and_set(idx)) continue;
+        output_neighbor_list_ptr[out_j] = idx;
+        out_j++;
+      }
+
+      // Fill with random nodes if the length of the filled neighbor list is less than the degree.
+      for (size_t j = out_j; j < build_config_.node_degree; j++) {
+        uint64_t rnd = static_cast<uint64_t>(i * build_config_.node_degree + j + 1);
+        uint64_t idx = 0;
+        bool placed  = false;
+        for (size_t attempts = 0; !placed && attempts < build_config_.node_degree; attempts++) {
+          rnd    = cuvs::neighbors::detail::device::xorshift64(rnd);
+          idx    = rnd % nrow_;
+          placed = (idx != i) && test_and_set(idx);
+        }
+        output_neighbor_list_ptr[j] = static_cast<int>(idx);
+      }
+
+      // Unset every bit this row touched so the array is back to all-zero for the next row this
+      // thread processes. Since seen_bits is all-zero on entry to this row and thread-local, the
+      // only bits set anywhere are ones this row's own entries set, so the whole word covering
+      // idx can be zeroed outright rather than masking off just its one bit.
+      for (size_t k = 0; k < build_config_.node_degree; k++) {
+        size_t idx          = static_cast<size_t>(output_neighbor_list_ptr[k]);
+        seen_bits[idx >> 6] = 0;
+      }
+    }
+  }
   graph_.h_graph = nullptr;
 
 #pragma omp parallel for
@@ -2844,7 +2896,7 @@ void GNND<Data_t, Index_t>::build(
   DistData_t* output_distances,
   DistEpilogue_t dist_epilogue)
 {
-  cudaStream_t stream = raft::resource::get_cuda_stream(res);
+  cudaStream_t stream = raft::resource::get_cuda_stream(res).get();
   nrow_               = static_cast<size_t>(dataset.n_rows());
   graph_.nrow         = nrow_;
   graph_.bloom_filter.set_nrow(nrow_);
