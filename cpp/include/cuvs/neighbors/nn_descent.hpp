@@ -543,7 +543,10 @@ auto build(raft::resources const& res,
            std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph =
              std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>;
 /**
- * @copydoc build(raft::resources const& res, index_params const& params, cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset, std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>
+ * @copydoc build(raft::resources const& res, index_params const& params,
+ * cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset,
+ * std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt)
+ * -> cuvs::neighbors::nn_descent::index<uint32_t>
  */
 auto build(raft::resources const& res,
            index_params const& params,
@@ -551,7 +554,10 @@ auto build(raft::resources const& res,
            std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph =
              std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>;
 /**
- * @copydoc build(raft::resources const& res, index_params const& params, cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset, std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>
+ * @copydoc build(raft::resources const& res, index_params const& params,
+ * cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset,
+ * std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt)
+ * -> cuvs::neighbors::nn_descent::index<uint32_t>
  */
 auto build(raft::resources const& res,
            index_params const& params,
@@ -559,7 +565,10 @@ auto build(raft::resources const& res,
            std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph =
              std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>;
 /**
- * @copydoc build(raft::resources const& res, index_params const& params, cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset, std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt) -> cuvs::neighbors::nn_descent::index<uint32_t>
+ * @copydoc build(raft::resources const& res, index_params const& params,
+ * cuvs::neighbors::device_bbq_dataset_view<float, int64_t> dataset,
+ * std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph = std::nullopt)
+ * -> cuvs::neighbors::nn_descent::index<uint32_t>
  */
 auto build(raft::resources const& res,
            index_params const& params,

@@ -271,11 +271,11 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
 }
 
 inline host_quantizer_storage quantize(const float* data,
-                             int64_t n_rows,
-                             int64_t dim,
-                             uint8_t bits,
-                             cuvs::distance::DistanceType metric,
-                             bbq_code_layout layout = bbq_code_layout::packed_8b)
+                                       int64_t n_rows,
+                                       int64_t dim,
+                                       uint8_t bits,
+                                       cuvs::distance::DistanceType metric,
+                                       bbq_code_layout layout = bbq_code_layout::packed_8b)
 {
   const bool euclidean = metric == cuvs::distance::DistanceType::L2Expanded ||
                          metric == cuvs::distance::DistanceType::L2SqrtExpanded;
@@ -298,7 +298,7 @@ inline host_quantizer_storage quantize(const float* data,
   auto upper_intervals          = raft::make_host_vector<float, int64_t>(n_rows);
   auto additional_corrections   = raft::make_host_vector<float, int64_t>(n_rows);
   auto quantized_component_sums = raft::make_host_vector<int32_t, int64_t>(n_rows);
-  auto row_norm = raft::make_host_vector<float, int64_t>(n_rows);
+  auto row_norm                 = raft::make_host_vector<float, int64_t>(n_rows);
 
 #pragma omp parallel for
   for (int64_t i = 0; i < n_rows; ++i) {
@@ -324,18 +324,18 @@ inline host_quantizer_storage quantize(const float* data,
   std::copy(packed.begin(), packed.end(), codes.data_handle());
 
   host_quantizer_storage out{std::move(codes),
-                   std::move(lower_intervals),
-                   std::move(upper_intervals),
-                   std::move(additional_corrections),
-                   std::move(quantized_component_sums),
-                   std::move(centroid),
-                   raft::make_host_vector<float, int64_t>(n_rows),
-                   raft::make_host_vector<float, int64_t>(n_rows),
-                   std::move(row_norm),
-                   static_cast<uint32_t>(bits),
-                   layout,
-                   metric,
-                   centroid_norm_sq};
+                             std::move(lower_intervals),
+                             std::move(upper_intervals),
+                             std::move(additional_corrections),
+                             std::move(quantized_component_sums),
+                             std::move(centroid),
+                             raft::make_host_vector<float, int64_t>(n_rows),
+                             raft::make_host_vector<float, int64_t>(n_rows),
+                             std::move(row_norm),
+                             static_cast<uint32_t>(bits),
+                             layout,
+                             metric,
+                             centroid_norm_sq};
   derive_dequant_factors(out);
   return out;
 }
@@ -408,7 +408,8 @@ auto copy_bbq_owning_storage_host_to_device(raft::resources const& res,
 }
 
 template <typename IdxT>
-auto make_device_bbq_dataset(raft::resources const& res, std::vector<host_quantizer_storage> const& host)
+auto make_device_bbq_dataset(raft::resources const& res,
+                             std::vector<host_quantizer_storage> const& host)
   -> cuvs::neighbors::device_bbq_dataset<float, IdxT>
 {
   RAFT_EXPECTS(host.size() != 0, "host BBQ dataset has no storage");
@@ -513,25 +514,27 @@ void for_each_buffer(host_quantizer_storage& q, OpT op)
 
 /** Allocates the arrays of the given shape, leaving their contents undefined. */
 inline auto make_host_quantizer_storage(int64_t n_rows,
-                              int64_t dim,
-                              uint32_t bits,
-                              bbq_code_layout layout,
-                              cuvs::distance::DistanceType metric) -> host_quantizer_storage
+                                        int64_t dim,
+                                        uint32_t bits,
+                                        bbq_code_layout layout,
+                                        cuvs::distance::DistanceType metric)
+  -> host_quantizer_storage
 {
-  return host_quantizer_storage{raft::make_host_matrix<uint8_t, int64_t>(
-                        n_rows, static_cast<int64_t>(encoded_row_length(dim, bits, layout))),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      raft::make_host_vector<int32_t, int64_t>(n_rows),
-                      raft::make_host_vector<float, int64_t>(dim),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      raft::make_host_vector<float, int64_t>(n_rows),
-                      bits,
-                      layout,
-                      metric,
-                      0.0f};
+  return host_quantizer_storage{
+    raft::make_host_matrix<uint8_t, int64_t>(
+      n_rows, static_cast<int64_t>(encoded_row_length(dim, bits, layout))),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    raft::make_host_vector<int32_t, int64_t>(n_rows),
+    raft::make_host_vector<float, int64_t>(dim),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    raft::make_host_vector<float, int64_t>(n_rows),
+    bits,
+    layout,
+    metric,
+    0.0f};
 }
 
 /** Reads the codes back if the file is present and has exactly the expected length. */

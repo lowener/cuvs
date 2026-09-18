@@ -141,8 +141,15 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
       raft::update_host(host_data.data(), database.data_handle(), host_data.size(), stream_);
       raft::resource::sync_stream(handle_);
 
-      auto owning_dataset = cuvs_internal::bbq::quantize_to_device(handle_, host_data.data(), ps.n_rows, ps.dim, ps.metric, ps.layout, ps.second_dataset_layout.value_or(ps.layout));
-      auto dataset        = owning_dataset.as_dataset_view();
+      auto owning_dataset =
+        cuvs_internal::bbq::quantize_to_device(handle_,
+                                               host_data.data(),
+                                               ps.n_rows,
+                                               ps.dim,
+                                               ps.metric,
+                                               ps.layout,
+                                               ps.second_dataset_layout.value_or(ps.layout));
+      auto dataset = owning_dataset.as_dataset_view();
       nn_descent::index_params index_params;
       index_params.metric                    = ps.metric;
       index_params.graph_degree              = ps.graph_degree;
