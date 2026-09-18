@@ -1335,11 +1335,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     s_doc_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES / query_planes * document_planes + DOC_PAD];
   __shared__ __align__(alignof(uint32_t))
     uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES + BBQ_PAD];
-  // Holds the final (post-metric, post-epilogue) float distance per cell -- computed once, inline,
-  // right when a cell's raw dot product is ready (see the store loops below), instead of the raw
-  // u32 dot product get_min_item_fused used to convert lazily, per read. That removes the need for
-  // get_min_item_fused entirely: both sweeps below read finished floats via the plain
-  // get_min_item, same as the dense/SIMT kernels.
+  // Holds the final (post-metric, post-epilogue) float distance per cell
   __shared__ DistData_t s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
   __shared__ int s_unique_counter[2];
   // Document-side (row axis) dequant factors, indexed by list position -- shared by both phases
@@ -1689,19 +1685,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 // asymmetric (two quantizers) cases. Modeled on local_join_kernel_wmma: nvcuda::wmma fragments
 // (u4 x u4 -> s32, shape m8n8k32) replace the popc/dp4a inner product; the accumulator lives in
 // registers across the whole K reduction and is stored to s_distances once per (row-tile,
-// col-tile), not accumulated into shared memory every step like the scalar kernel. That raw store
-// is then converted to final float distances in place -- see run_phase's conversion loop and
-// bbq_calculate_metric.
-//
-// The two cases differ in exactly three places, all compile-time:
-//   * DocumentLayout / QueryLayout -- each operand is promoted to 4-bit width by
-//     stage_promoted_tile, and packed_4b is the identity case, so "no promotion" is not a
-//     separate code path. packed_1b is the only promotable document layout (4x4, 1x4 by dispatch
-//     alone); transposed_2b never reaches this kernel.
-//   * SelfJoin -- when both operands are the same quantizer, phase 1 (new x new) stages one
-//     buffer and feeds it to both fragments, halving that phase's SMEM writes. Asymmetric can
-//     never do this: document and query are two distinct quantized representations of the same
-//     rows, so aliasing them would compute doc.doc, a different (worse) estimator.
+// col-tile), not accumulated into shared memory every step like the scalar kernel.
 //
 // Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
 // grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
@@ -1785,10 +1769,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   __shared__ __align__(16) uint8_t s_row_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + MMA_PAD];
   // s_col_vec aliases s_distances's memory instead of its own array: their live ranges never
   // overlap (col_vec fully consumed by the kk-loop before distances are stored; distances fully
-  // consumed by the min-search loop before the next phase re-stages col_vec). Same pattern as
-  // local_join_kernel_wmma's s_distances/s_ov aliasing. store_matrix_sync below writes raw int
-  // accumulator values into this same memory (reinterpreted as int*); the conversion loop right
-  // after it turns those into final DistData_t floats in place -- see bbq_calculate_metric.
+  // consumed by the min-search loop before the next phase re-stages col_vec).
   __shared__ __align__(16) DistData_t s_distances[MAX_NUM_BI_SAMPLES * MMA_STORE_STRIDE];
   static_assert(sizeof(s_distances) >= MAX_NUM_BI_SAMPLES * (BBQ_ROW_BYTES + MMA_PAD),
                 "s_col_vec aliases s_distances's memory and must fit inside it");
@@ -1956,9 +1937,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       }
 
       // Cell (row, col) is read (as raw int, via this alias) and written (as the final float) at
-      // the same address by the same thread, so no cell is ever touched by more than one thread --
-      // no intra-loop synchronization needed, just the barrier below before any thread reads
-      // another thread's cell via get_min_item.
+      // the same address by the same thread
       auto* raw_view            = reinterpret_cast<int*>(s_distances);
       constexpr int total_cells = MAX_NUM_BI_SAMPLES * MAX_NUM_BI_SAMPLES;
       for (int i = tx; i < total_cells; i += BLOCK_SIZE) {
@@ -1989,10 +1968,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   }
   __syncthreads();
 
-  // list_idx indexes s_list (which id this row belongs to); idx_in_list is the row's position in
-  // the distance matrix. They differ in phase 2's second branch, where the id comes from the
-  // old-neighbour half of s_list but the matrix position is relative to the new half.
-
   // ---- Phase 1: new x new ----
   run_phase(new_neighbors, new_size, std::integral_constant<bool, SelfJoin>{}, false);
 
@@ -2017,9 +1992,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   // ---- Phase 2: new x old ----
   run_phase(old_neighbors, old_size, std::false_type{}, n_tiles == 1);
 
-  // Split from one combined [0, 2*MAX_NUM_BI_SAMPLES) loop into two: MAX_NUM_BI_SAMPLES is evenly
-  // divisible by num_warps (64/16), so this costs no extra steps, and it turns the old
-  // branch-per-half + double bounds-guard into one guard per loop, each new_size/old_size sized.
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= new_size) continue;
@@ -2035,9 +2007,6 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     }
   }
 
-  // loop-new below reads the same s_distances phase 2 wrote above, column-major (find_in_row =
-  // false) instead of row-major -- both sweeps read the identical, already-finished float matrix,
-  // no restaging needed (plain get_min_item doesn't consume per-row factors at read time at all).
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES, num_warps); ++step) {
     const int idx_in_list = step * num_warps + tx / raft::warp_size();
     if (idx_in_list >= old_size) continue;
