@@ -332,7 +332,7 @@ void sort_knn_graph_bbq_impl(raft::resources const& res,
   constexpr uint32_t block_size = 256;
   auto const warps              = block_size / raft::WarpSize;
   auto const blocks             = (graph_size + warps - 1) / warps;
-  kernel<<<blocks, block_size, 0, raft::resource::get_cuda_stream(res)>>>(
+  kernel<<<blocks, block_size, 0, raft::resource::get_cuda_stream(res).get()>>>(
     quantizer_document,
     quantizer_query,
     d_input_graph.data_handle(),
