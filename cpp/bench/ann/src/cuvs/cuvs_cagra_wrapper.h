@@ -262,8 +262,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   /** Train the VPQ codebooks and create the CAGRA-Q index sharing the graph of `index_`. */
   void compress_dataset(const T* dataset, size_t nrow);
 
-  /** Prototype: run the NN-Descent graph build on the BBQ codes prepare_build() made. */
-  void build_bbq_nn_descent(size_t nrow, const cuvs::neighbors::cagra::index_params& params);
+  /** Prototype: build the CAGRA graph from the BBQ codes prepare_build() made. */
+  void build_bbq(const cuvs::neighbors::cagra::index_params& params);
 
   // handle_ must go first to make sure it dies last and all memory allocated in pool
   configured_raft_resources handle_{};
@@ -300,6 +300,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   std::shared_ptr<cuvs::neighbors::cagra::vpq_f16_index<T, IdxT>> vpq_index_;
   // Set by prepare_build() when BBQ is on; dropped as soon as the kNN graph is out.
   std::shared_ptr<cuvs::neighbors::device_bbq_dataset<float, int64_t>> bbq_dataset_;
+  std::shared_ptr<cuvs::neighbors::cagra::bbq_index<float, IdxT>> bbq_index_;
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -312,35 +313,19 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 };
 
 template <typename T, typename IdxT>
-void cuvs_cagra<T, IdxT>::build_bbq_nn_descent(size_t nrow,
-                                               const cuvs::neighbors::cagra::index_params& params)
+void cuvs_cagra<T, IdxT>::build_bbq(const cuvs::neighbors::cagra::index_params& params)
 {
-  using nn_descent_params = cuvs::neighbors::cagra::graph_build_params::nn_descent_params;
-  RAFT_EXPECTS(std::holds_alternative<nn_descent_params>(params.graph_build_params),
-               "BBQ requires graph_build_algo=NN_DESCENT.");
-  RAFT_EXPECTS(!params.guarantee_connectivity && index_params_.num_dataset_splits <= 1,
-               "BBQ NN-Descent supports neither guarantee_connectivity nor dataset splits.");
-  const auto n_rows = static_cast<int64_t>(nrow);
+  RAFT_EXPECTS(index_params_.num_dataset_splits <= 1, "BBQ does not support dataset splits.");
 
-  // Aligned the same way CAGRA aligns them on the dense path.
-  auto nnd_params = std::get<nn_descent_params>(params.graph_build_params);
-  nnd_params.metric           = params.metric;
-  nnd_params.graph_degree     = params.intermediate_graph_degree;
-  nnd_params.return_distances = false;
-
-  auto knn_graph = raft::make_host_matrix<IdxT, int64_t>(
-    n_rows, static_cast<int64_t>(params.intermediate_graph_degree));
-  cuvs::neighbors::nn_descent::build(
-    handle_, nnd_params, bbq_dataset_->as_dataset_view(), knn_graph.view());
+  auto bbq_params                    = params;
+  bbq_params.attach_dataset_on_build = false;
+  bbq_index_ = std::make_shared<cuvs::neighbors::cagra::bbq_index<float, IdxT>>(
+    cuvs::neighbors::cagra::build(handle_, bbq_params, bbq_dataset_->as_dataset_view()));
   bbq_dataset_.reset();
 
-  auto cagra_graph =
-    raft::make_host_matrix<IdxT, int64_t>(n_rows, static_cast<int64_t>(params.graph_degree));
-  cuvs::neighbors::cagra::helpers::optimize(handle_, knn_graph.view(), cagra_graph.view());
-
-  // As on the host path: the index keeps the graph only and set_search_param uploads the rows.
+  // update_graph only views a device graph, so bbq_index_ has to outlive index_'s use of it.
   index_ = std::make_shared<index_type>(handle_, params.metric);
-  index_->update_graph(handle_, raft::make_const_mdspan(cagra_graph.view()));
+  index_->update_graph(handle_, bbq_index_->graph());
 }
 
 template <typename T, typename IdxT>
@@ -349,7 +334,7 @@ void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
   auto dataset_extents = raft::make_extents<int64_t>(nrow, dim_);
   auto params          = index_params_.cagra_params(dataset_extents, parse_metric_type(metric_));
   if (bbq_dataset_) {
-    build_bbq_nn_descent(nrow, params);
+    build_bbq(params);
     return;
   }
   // The host paths keep the graph only, so the index need not hold a view of the caller's rows.
@@ -538,8 +523,9 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
     // NB: update_graph() only stores a view in the index. We need to keep the graph object alive.
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
     if (vpq_index_) { vpq_index_->update_graph(handle_, make_const_mdspan(graph_->view())); }
-    // graph_ owns the graph now, so release the host index that used to own it.
+    // graph_ owns the graph now, so release the index that used to own it.
     host_index_.reset();
+    bbq_index_.reset();
     needs_dynamic_batcher_update = true;
   }
 
