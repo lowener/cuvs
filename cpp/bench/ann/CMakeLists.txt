@@ -177,7 +177,6 @@ function(ConfigureAnnBench)
   target_link_libraries(
     ${BENCH_NAME}
     PRIVATE ${ConfigureAnnBench_LINKS}
-            $<TARGET_NAME_IF_EXISTS:cuvs_internal>
             nlohmann_json::nlohmann_json
             sqlite3
             Threads::Threads

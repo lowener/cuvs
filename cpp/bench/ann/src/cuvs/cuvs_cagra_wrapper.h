@@ -18,7 +18,6 @@
 #include <cuvs/neighbors/ivf_pq.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
-#include <cuvs_internal/preprocessing/bbq_cpu_quantize.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/core/logger.hpp>
@@ -166,14 +165,6 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
     using dataset_dependent_params = std::function<cuvs::neighbors::cagra::index_params(
       raft::matrix_extent<int64_t>, cuvs::distance::DistanceType)>;
     dataset_dependent_params cagra_params;
-    /** Prototype: run the NN-Descent graph build on BBQ codes of these layouts. Tokens follow
-     *  my_tests/bbq's CLI convention: bare N = densely packed (tensor-core), N + "t" =
-     *  transposed (SIMT), e.g. "4" (packed_4b) vs. "4t" (transposed_4b). */
-    struct bbq_param {
-      std::string query_format;
-      std::string doc_format;
-    };
-    std::optional<bbq_param> bbq                           = std::nullopt;
     std::optional<cuvs::neighbors::vpq_params> compression = std::nullopt;
     size_t num_dataset_splits                              = 1;
     CagraMergeType merge_type                              = CagraMergeType::kPhysical;
@@ -196,23 +187,6 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   }
 
   void build(const T* dataset, size_t nrow) final;
-
-  /** Prototype: quantize the base set (or read the cached codes) before the build is timed. */
-  void prepare_build(const T* dataset, size_t nrow) override
-  {
-    if constexpr (std::is_same_v<T, float>) {
-      if (index_params_.bbq.has_value()) {
-        bbq_dataset_ = std::make_shared<cuvs::neighbors::device_bbq_dataset<float, int64_t>>(
-          cuvs_internal::bbq::quantize_to_device(handle_,
-                                                 dataset,
-                                                 static_cast<int64_t>(nrow),
-                                                 static_cast<int64_t>(dim_),
-                                                 parse_metric_type(metric_),
-                                                 index_params_.bbq->query_format,
-                                                 index_params_.bbq->doc_format));
-      }
-    }
-  }
 
   void set_search_param(const search_param_base& param, const void* filter_bitset) override;
 
@@ -262,9 +236,6 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   /** Train the VPQ codebooks and create the CAGRA-Q index sharing the graph of `index_`. */
   void compress_dataset(const T* dataset, size_t nrow);
 
-  /** Prototype: build the CAGRA graph from the BBQ codes prepare_build() made. */
-  void build_bbq(const cuvs::neighbors::cagra::index_params& params);
-
   // handle_ must go first to make sure it dies last and all memory allocated in pool
   configured_raft_resources handle_{};
   rmm::mr::pinned_host_memory_resource mr_pinned_;
@@ -298,8 +269,6 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
       std::make_shared<std::vector<raft::device_matrix<T, int64_t, raft::row_major>>>();
   std::shared_ptr<cuvs::neighbors::device_vpq_dataset<half, int64_t>> vpq_dataset_;
   std::shared_ptr<cuvs::neighbors::cagra::device_pq_index<T, IdxT, half>> vpq_index_;
-  std::shared_ptr<cuvs::neighbors::device_bbq_dataset<float, int64_t>> bbq_dataset_;
-  std::shared_ptr<cuvs::neighbors::cagra::bbq_index<float, IdxT>> bbq_index_;
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -312,30 +281,10 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 };
 
 template <typename T, typename IdxT>
-void cuvs_cagra<T, IdxT>::build_bbq(const cuvs::neighbors::cagra::index_params& params)
-{
-  RAFT_EXPECTS(index_params_.num_dataset_splits <= 1, "BBQ does not support dataset splits.");
-
-  auto bbq_params                    = params;
-  bbq_params.attach_dataset_on_build = false;
-  bbq_index_ = std::make_shared<cuvs::neighbors::cagra::bbq_index<float, IdxT>>(
-    cuvs::neighbors::cagra::build(handle_, bbq_params, bbq_dataset_->as_dataset_view()));
-  bbq_dataset_.reset();
-
-  // update_graph only views a device graph, so bbq_index_ has to outlive index_'s use of it.
-  index_ = std::make_shared<index_type>(handle_, params.metric);
-  index_->update_graph(handle_, bbq_index_->graph());
-}
-
-template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
 {
   auto dataset_extents = raft::make_extents<int64_t>(nrow, dim_);
   auto params          = index_params_.cagra_params(dataset_extents, parse_metric_type(metric_));
-  if (bbq_dataset_) {
-    build_bbq(params);
-    return;
-  }
   // The host paths keep the graph only, so the index need not hold a view of the caller's rows.
   auto host_params                    = params;
   host_params.attach_dataset_on_build = false;
@@ -522,9 +471,8 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
     // NB: update_graph() only stores a view in the index. We need to keep the graph object alive.
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
     if (vpq_index_) { vpq_index_->update_graph(handle_, make_const_mdspan(graph_->view())); }
-    // graph_ owns the graph now, so release the index that used to own it.
+    // graph_ owns the graph now, so release the host index that used to own it.
     host_index_.reset();
-    bbq_index_.reset();
     needs_dynamic_batcher_update = true;
   }
 

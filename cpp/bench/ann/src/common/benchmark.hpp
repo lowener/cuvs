@@ -137,12 +137,6 @@ void bench_build(::benchmark::State& state,
   const T* base_set      = dataset->base_set(algo_property.dataset_memory_type);
   std::size_t index_size = dataset->base_set_size();
 
-  try {
-    algo->prepare_build(base_set, index_size);
-  } catch (const std::exception& e) {
-    return state.SkipWithError("Failed to prepare the build: " + std::string(e.what()));
-  }
-
   cuda_timer gpu_timer{algo};
   {
     nvtx_stats nvtx_stats{state};
