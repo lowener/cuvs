@@ -8,7 +8,7 @@
 #include "utils.hpp"
 
 // TODO: This shouldn't be invoking anything from spatial/knn
-#include "../../bbq.cuh"
+#include "../../../preprocessing/quantize/detail/bbq_distance.cuh"
 #include "../ann_utils.cuh"
 
 #include <raft/core/copy.cuh>

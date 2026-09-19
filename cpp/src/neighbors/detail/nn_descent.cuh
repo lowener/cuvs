@@ -11,7 +11,7 @@
 
 #include "../../core/nvtx.hpp"
 #include "../../core/omp_wrapper.hpp"
-#include "../bbq.cuh"
+#include "../../preprocessing/quantize/detail/bbq_distance.cuh"
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/bbq.hpp>
