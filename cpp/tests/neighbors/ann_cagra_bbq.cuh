@@ -261,6 +261,11 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
 
   void SetUp() override
   {
+    // nn-descent rejects packed_4b below sm_75.
+    if (ps.layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_4b &&
+        cuvs::neighbors::device_compute_capability() < 75) {
+      GTEST_SKIP() << "packed_4b requires int4 tensor cores (compute capability 7.5 or newer)";
+    }
     database.resize(static_cast<size_t>(ps.n_rows) * ps.dim, stream_);
     search_queries.resize(static_cast<size_t>(ps.n_queries) * ps.dim, stream_);
     raft::random::RngState r(1234ULL);

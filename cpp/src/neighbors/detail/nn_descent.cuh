@@ -2987,6 +2987,25 @@ void build(raft::resources const& res,
                "InnerProduct.");
   RAFT_EXPECTS(idx.metric() == front_quantizer.metric,
                "BBQ dataset metric does not match the NN-Descent metric.");
+  // packed_4b is the only layout dispatched to local_join_kernel_bbq_wmma, and the int4 MMA that
+  // kernel is built around only exists from sm_75 on.
+  if (dataset.has_bit_and_layout(4, bbq_code_layout::packed_4b)) {
+    auto kernel       = local_join_kernel_bbq_wmma<bbq_code_layout::packed_4b,
+                                                   bbq_code_layout::packed_4b,
+                                                   true,
+                                                   DataT,
+                                                   int,
+                                                   InternalID_t<int>,
+                                                   raft::identity_op>;
+    auto runtime_arch = raft::util::arch::kernel_virtual_arch(reinterpret_cast<void*>(kernel));
+    RAFT_EXPECTS(
+      raft::util::arch::SM_range(raft::util::arch::SM_75(), raft::util::arch::SM_future())
+        .contains(runtime_arch),
+      "The BBQ packed_4b layout requires int4 tensor cores (compute capability 7.5 or newer), but "
+      "the local join kernel resolves to %d.%d here. Use transposed_4b for 4-bit codes instead.",
+      runtime_arch.value() / 100,
+      (runtime_arch.value() / 10) % 10);
+  }
 
   size_t extended_graph_degree;
   size_t graph_degree;

@@ -102,6 +102,11 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
  protected:
   void testNNDescent()
   {
+    // nn-descent rejects packed_4b below sm_75.
+    if (ps.layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_4b &&
+        cuvs::neighbors::device_compute_capability() < 75) {
+      GTEST_SKIP() << "packed_4b requires int4 tensor cores (compute capability 7.5 or newer)";
+    }
     if (ps.second_dataset_layout.has_value()) {
       // The document must be strictly coarser than the query; the pair's layouts are stated in
       // the spec, so validity of the layout combination is the spec's business, not inferred here.
