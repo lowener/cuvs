@@ -31,15 +31,15 @@ namespace preprocessing::quantize::bbq {
 enum class bbq_code_layout {
   single_bit, /** Each dimension is quantized to a single bit and packed into bytes. Reflects
                * OptimizedScalarQuantizer.packAsBinary. */
-  dibit,      /** Each dimension is quantized to 2 bits (dibit) and transposed for bitwise operations.
-               * Same principle as transpose_half_byte, but for 2 bits.
-               * Reflects OptimizedScalarQuantizer.transposeDibit. */
-  transpose_half_byte, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
-                        * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
-                        * every dimension is in the first set dimensions bits, or (dimensions/8)
-                        * bytes. The second, third, and fourth bits are in the second, third, and
-                        * fourth set of dimensions bits, respectively. Format used for queries. */
-  packed_nibble, /** Each dimension is quantized to 4 bits, two values are packed into each output
+  dibit, /** Each dimension is quantized to 2 bits (dibit) and transposed for bitwise operations.
+          * This uses the same principle as transpose_half_byte for 2 bits.
+          * Reflects OptimizedScalarQuantizer.transposeDibit. */
+  transpose_half_byte, /** Each dimension is quantized to 4 bits and optimized for bitwise
+                        * operations. Reflects OptimizedScalarQuantizer.transposeHalfByte. The first
+                        * bit of every dimension is stored in the first dimension-bit set of
+                        * dimensions/8 bytes. Bits two through four are stored in their respective
+                        * dimension-bit sets. This format is used for queries. */
+  packed_nibble, /** Each dimension is quantized to 4 bits with two values packed into each output
                   * byte. Reflects OffHeapScalarQuantizedVectorValues.packNibbles. */
   seven_bit,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
   unsigned_byte, /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
@@ -52,7 +52,7 @@ struct bbq_quantizer {
   template <typename T, typename IdT, typename Acc>
   using dense_owning_matrix = cuvs::neighbors::detail::dense_owning_matrix<T, IdT, Acc>;
   template <typename T, typename IdT, typename Acc>
-  using dense_owning_vector = cuvs::neighbors::detail::dense_owning_vector<T, IdT, Acc>;
+  using dense_owning_vector = cuvs::neighbors::detail::vector<T, IdT, Acc>;
   dense_owning_matrix<uint8_t, IdxT, Accessor> codes;
   dense_owning_vector<float, IdxT, Accessor> lower_intervals;
   dense_owning_vector<float, IdxT, Accessor> upper_intervals;
@@ -125,7 +125,7 @@ struct bbq_quantizer_view {
   template <typename T, typename IdT, typename Acc>
   using dense_view_matrix = cuvs::neighbors::detail::dense_view_matrix<T, IdT, Acc>;
   template <typename T, typename IdT, typename Acc>
-  using dense_view_vector = cuvs::neighbors::detail::dense_view_vector<T, IdT, Acc>;
+  using dense_view_vector = cuvs::neighbors::detail::vector_view<T, IdT, Acc>;
   dense_view_matrix<const uint8_t, IdxT, Accessor> codes;
   dense_view_vector<const float, IdxT, Accessor> lower_intervals;
   dense_view_vector<const float, IdxT, Accessor> upper_intervals;

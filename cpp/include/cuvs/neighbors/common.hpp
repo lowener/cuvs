@@ -309,10 +309,10 @@ template <typename ViewT, typename DataT, typename IdxT>
 using standard_dataset_view_storage = dense_row_major_dataset_view_storage<ViewT, DataT, IdxT>;
 
 template <typename T, typename IdxT, typename Accessor>
-using vector = raft::mdarray<T, raft::vector_extent<IdxT>, raft::layout_c_contiguous,  Accessor>
+using vector = raft::mdarray<T, raft::vector_extent<IdxT>, raft::layout_c_contiguous, Accessor>;
 
 template <typename T, typename IdxT, typename Accessor>
-using vector_view = raft::mdspan<T, raft::vector_extent<IdxT>, raft::layout_c_contiguous,  Accessor>
+using vector_view = raft::mdspan<T, raft::vector_extent<IdxT>, raft::layout_c_contiguous, Accessor>;
 // -----------------------------------------------------------------------------
 // VPQ compressed
 // -----------------------------------------------------------------------------
