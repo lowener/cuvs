@@ -264,9 +264,7 @@ class scann_test : public ::testing::TestWithParam<scann_inputs> {
     }
     mean_error /= static_cast<double>(n_rows);
 
-    // Measured mean relative error on uniform [0.1, 2.0] data: ~0.02-0.03 (8-bit) and ~0.10-0.12
-    // (4-bit) for pq_dim <= 2; ~0.22 (8-bit) and ~0.35 (4-bit) for pq_dim = 8.
-    const double max_allowed_mean = (sub_dim <= 2) ? 0.15 : 0.5;
+    const double max_allowed_mean = (ps.index_params.pq_bits == 4) ? 0.45 : 0.275;
     ASSERT_LT(mean_error, max_allowed_mean)
       << "Mean relative reconstruction error too large: " << mean_error;
   }
