@@ -9,6 +9,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/linalg/map.cuh>
+#include "detail/bbq_quantizer.cuh"
 
 namespace CUVS_EXPORT cuvs {
 
@@ -44,5 +45,13 @@ void resolve_dequant_factors(
                            });
 }
 }  // namespace helpers
+
+quantizer<float, int64_t> build(raft::resources const& res,
+                                const params params,
+                                raft::device_matrix_view<const float, int64_t> dataset)
+{
+  return detail::build(res, params, dataset);
+}
+
 }  // namespace preprocessing::quantize::bbq
 }  // namespace CUVS_EXPORT cuvs

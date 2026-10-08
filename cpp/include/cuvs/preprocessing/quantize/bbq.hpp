@@ -56,6 +56,19 @@ enum class bbq_code_layout {
 };
 
 /**
+ * layout: The code layout of the quantizer; the components are quantized to the layout's bit width.
+ * metric: Used for selecting the per-row additional correction: ||x - c||^2 for L2, x.c otherwise.
+ * lambda: Relative interval weight of the quantization error against the norm-preserving term of the loss.
+ * iters: Coordinate descent iterations per row.
+ */
+struct params {
+  bbq_code_layout layout = bbq_code_layout::packed_1b;
+  cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2Expanded;
+  float lambda = 0.1f;
+  int iters = 5;
+};
+
+/**
  * Bit width of a layout.
  */
 constexpr auto get_bit_width(bbq_code_layout layout) noexcept -> uint32_t
@@ -385,4 +398,29 @@ inline constexpr bool is_bbq_dataset_view_v =
 
 }  // namespace neighbors
 
+
+namespace preprocessing::quantize::bbq {
+
+
+/**
+ * @brief Initializes a BBQ Quantizer to be used for quantizing a dataset.
+ *
+ * Usage example:
+ * @code{.cpp}
+ * raft::handle_t handle;
+ * cuvs::preprocessing::quantize::bbq::params params;
+ * auto quantizer = cuvs::preprocessing::quantize::bbq::build(handle, params, dataset);
+ * @endcode
+ *
+ * @param[in] res raft resource
+ * @param[in] params configuration for BBQ quantizer, e.g. layout, metric, lambda, iters
+ * @param[in] dataset a row-major matrix view on device or host
+ *
+ * @return quantizer
+ */
+quantizer<float, int64_t> build(raft::resources const& res,
+  const params params,
+  raft::device_matrix_view<const float, int64_t> dataset);
+
+}  // namespace preprocessing::quantize::bbq
 }  // namespace CUVS_EXPORT cuvs
