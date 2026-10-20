@@ -36,6 +36,7 @@
 #include "../core/exceptions.hpp"
 #include "../core/interop.hpp"
 
+#include "../preprocessing/quantize/bbq_helpers.hpp"
 #include "c_api_box.hpp"
 #include "cagra.hpp"
 #include "c_api_box.hpp"
@@ -412,35 +413,24 @@ static void with_dataset_view(cuvsDataset_t dataset, Fn&& fn)
 template <typename T>
 void validate_bbq_layouts(cuvs::neighbors::device_bbq_dataset_view<T, int64_t> const& dataset)
 {
-  using layout_t = cuvs::preprocessing::quantize::bbq::bbq_code_layout;
-  if (dataset.storages.size() == 1) {
-    auto layout = dataset.storages.front().layout;
-    RAFT_EXPECTS(layout == layout_t::packed_1b || layout == layout_t::transposed_2b ||
-                   layout == layout_t::packed_4b || layout == layout_t::packed_7b ||
-                   layout == layout_t::packed_8b,
-                 "cuvsDatasetMakeBbqView: transposed_4b requires an asymmetric layout pair");
-    return;
+  std::vector<cuvs::preprocessing::quantize::bbq::bbq_code_layout> layouts;
+  for (auto const& storage : dataset.storages) {
+    layouts.push_back(storage.layout);
   }
-
-  const bool has_1b  = dataset.has_layout(layout_t::packed_1b);
-  const bool has_2bt = dataset.has_layout(layout_t::transposed_2b);
-  const bool has_4b  = dataset.has_layout(layout_t::packed_4b);
-  const bool has_4bt = dataset.has_layout(layout_t::transposed_4b);
-  RAFT_EXPECTS((has_1b && (has_4b || has_2bt || has_4bt)) || (has_2bt && has_4bt),
-               "cuvsDatasetMakeBbqView: unsupported asymmetric BBQ layout pair");
+  cuvs::preprocessing::quantize::bbq::c_api::expect_supported_layout_set(
+    layouts.data(), layouts.size(), "cuvsDatasetMakeBbqView");
 }
 
 template <typename T>
 auto get_cpp_bbq_quantizer_view(cuvsBbqQuantizer_t quantizer)
   -> cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>
 {
-  using owner_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_owning_storage<T, int64_t>;
-  using view_t  = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
+  using view_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
   RAFT_EXPECTS(quantizer != nullptr && quantizer->addr != 0,
                "cuvsDatasetMakeBbqView: null quantizer storage");
-  if (quantizer->is_owning) {
-    return reinterpret_cast<owner_t*>(quantizer->addr)->view();
-  }
+  RAFT_EXPECTS(!quantizer->is_owning,
+               "cuvsDatasetMakeBbqView: quantizers must come from cuvsBbqQuantizerCreateView; "
+               "encode a dataset with a built quantizer through cuvsBbqQuantizerTransform");
   return *reinterpret_cast<view_t*>(quantizer->addr);
 }
 
