@@ -311,7 +311,7 @@ struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
   {
     add_storage(std::move(storage));
   }
-  [[nodiscard]] auto as_dataset_view() const noexcept
+  [[nodiscard]] auto view() const noexcept
     -> dataset_view<bbq_dataset_container,
                     DataT,
                     IdxT,
