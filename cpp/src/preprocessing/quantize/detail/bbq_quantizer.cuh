@@ -445,14 +445,10 @@ inline auto build(raft::resources const& res,
 
   quantizer<DataT> quant{res, static_cast<uint32_t>(dim)};
   raft::stats::mean(res, dataset, quant.centroid.view());
-  auto centroid_norm_sq = raft::make_device_vector<float, int64_t>(res, 1);
   raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
     res,
     raft::make_device_matrix_view<const DataT, int64_t>(quant.centroid.data_handle(), 1, dim),
-    centroid_norm_sq.view());
-  const auto stream = raft::resource::get_cuda_stream(res).get();
-  raft::copy(&quant.centroid_norm_sq, centroid_norm_sq.data_handle(), 1, stream);
-  raft::resource::sync_stream(res);
+    raft::make_device_vector_view<float, int64_t>(quant.centroid_norm_sq.data_handle(), 1));
   return quant;
 }
 
@@ -485,7 +481,10 @@ inline auto transform(raft::resources const& res,
   quantizer<float> dataset_quantizer{res, quant.dim()};
   raft::copy(
     dataset_quantizer.centroid.data_handle(), quant.centroid.data_handle(), quant.dim(), stream);
-  dataset_quantizer.centroid_norm_sq = quant.centroid_norm_sq;
+  raft::copy(dataset_quantizer.centroid_norm_sq.data_handle(),
+             quant.centroid_norm_sq.data_handle(),
+             1,
+             stream);
   cuvs::neighbors::device_bbq_dataset<float, int64_t> encoded{std::move(dataset_quantizer)};
 
   auto encode = [&](bbq_code_layout layout) {

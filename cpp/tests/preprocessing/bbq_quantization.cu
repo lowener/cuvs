@@ -202,8 +202,12 @@ class BbqQuantizationTest : public ::testing::TestWithParam<BbqQuantizationInput
                                 cols_,
                                 cuvs::Compare<float>(),
                                 stream));
-    ASSERT_FLOAT_EQ(expected.centroid_norm_sq, quantizer.centroid_norm_sq);
-    ASSERT_FLOAT_EQ(expected.centroid_norm_sq, actual.quantizer.centroid_norm_sq);
+    ASSERT_EQ(actual.quantizer.centroid_norm_sq.data_handle(),
+              encoded.quantizer.centroid_norm_sq.data_handle());
+    ASSERT_FLOAT_EQ(expected.centroid_norm_sq,
+                    to_host(handle, quantizer.centroid_norm_sq.data_handle(), 1)[0]);
+    ASSERT_FLOAT_EQ(expected.centroid_norm_sq,
+                    to_host(handle, actual.quantizer.centroid_norm_sq.data_handle(), 1)[0]);
 
     // A row sitting on the threshold of interval search stop can end up with a different interval.
     // Check that at least 99.5% of the rows match within 1e-4 of the reference.

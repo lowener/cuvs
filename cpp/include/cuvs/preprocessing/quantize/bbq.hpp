@@ -129,24 +129,25 @@ struct quantizer_view;
 template <typename DataT>
 struct quantizer {
   raft::device_vector<DataT, int64_t> centroid;
-  float centroid_norm_sq{};
+  raft::device_scalar<float, int64_t> centroid_norm_sq;
 
   quantizer(raft::resources const& res, uint32_t dim)
-    : centroid{raft::make_device_vector<DataT, int64_t>(res, static_cast<int64_t>(dim))}
+    : centroid{raft::make_device_vector<DataT, int64_t>(res, static_cast<int64_t>(dim))},
+      centroid_norm_sq{raft::make_device_scalar<float, int64_t>(res)}
   {
   }
 
   auto dim() const noexcept -> uint32_t { return static_cast<uint32_t>(centroid.extent(0)); }
   [[nodiscard]] auto view() const noexcept -> quantizer_view<DataT>
   {
-    return quantizer_view<DataT>{centroid.view(), centroid_norm_sq};
+    return quantizer_view<DataT>{centroid.view(), centroid_norm_sq.view()};
   }
 };
 
 template <typename DataT>
 struct quantizer_view {
   raft::device_vector_view<const DataT, int64_t> centroid;
-  float centroid_norm_sq{};
+  raft::device_scalar_view<const float, int64_t> centroid_norm_sq;
 
   constexpr auto dim() const noexcept -> uint32_t
   {
@@ -329,8 +330,6 @@ struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
 
   void add_storage(owning_storage_type&& storage)
   {
-    RAFT_EXPECTS(storage.quantizer.centroid_norm_sq == quantizer.centroid_norm_sq,
-                 "Storage was not encoded with the quantizer of this dataset.");
     RAFT_EXPECTS(!has_layout(storage.layout), "Storage already exists with layout.");
     storages.push_back(std::move(storage));
   }

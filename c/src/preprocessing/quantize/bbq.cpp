@@ -9,8 +9,12 @@
 #include "../../core/exceptions.hpp"
 #include "../../core/interop.hpp"
 
+#include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
 #include <raft/core/mdspan_types.hpp>
+#include <raft/util/cudart_utils.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -18,9 +22,12 @@
 namespace {
 
 template <typename T>
-void destroy_typed_addr(void* ptr)
+void destroy_quantizer_view(void* ptr)
 {
-  delete reinterpret_cast<T*>(ptr);
+  using storage_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
+  std::unique_ptr<storage_t> storage{reinterpret_cast<storage_t*>(ptr)};
+  RAFT_CUDA_TRY_NO_THROW(
+    cudaFree(const_cast<float*>(storage->quantizer.centroid_norm_sq.data_handle())));
 }
 
 auto to_cpp_layout(cuvsBbqCodeLayout_t layout)
@@ -51,7 +58,7 @@ auto make_cpp_quantizer_view(
   DLManagedTensor* row_norm_tensor,
   cuvsBbqCodeLayout_t c_layout,
   cuvsDistanceType metric,
-  float centroid_norm_sq)
+  raft::device_scalar_view<const float, int64_t> centroid_norm_sq)
   -> cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>
 {
   using quantizer_view_t = cuvs::preprocessing::quantize::bbq::quantizer_view<T>;
@@ -117,25 +124,39 @@ void make_and_bind_quantizer_view(
   cuvsDistanceType metric,
   float centroid_norm_sq)
 {
-  using view_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
-  auto view    = std::make_unique<view_t>(make_cpp_quantizer_view<T>(codes,
-                                                                  lower_intervals,
-                                                                  upper_intervals,
-                                                                  additional_corrections,
-                                                                  quantized_component_sums,
-                                                                  centroid,
-                                                                  dequant_delta,
-                                                                  dequant_sum_delta,
-                                                                  row_norm,
-                                                                  layout,
-                                                                  metric,
-                                                                  centroid_norm_sq));
-  auto handle          = std::make_unique<cuvsBbqQuantizer>();
-  handle->addr         = reinterpret_cast<uintptr_t>(view.release());
-  handle->destroy_addr = &destroy_typed_addr<view_t>;
-  handle->dtype        = dtype;
-  handle->is_owning    = false;
-  *output              = handle.release();
+  using storage_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
+  // The norm arrives by value, transfer it to device memory
+  float* device_norm_sq = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(&device_norm_sq, sizeof(float)));
+  try {
+    auto stream = rmm::cuda_stream_default;
+    raft::copy(device_norm_sq, &centroid_norm_sq, 1, stream);
+    stream.sync();
+
+    auto storage = std::make_unique<storage_t>(make_cpp_quantizer_view<T>(
+      codes,
+      lower_intervals,
+      upper_intervals,
+      additional_corrections,
+      quantized_component_sums,
+      centroid,
+      dequant_delta,
+      dequant_sum_delta,
+      row_norm,
+      layout,
+      metric,
+      raft::make_device_scalar_view<const float, int64_t>(device_norm_sq)));
+
+    auto handle          = std::make_unique<cuvsBbqQuantizer>();
+    handle->addr         = reinterpret_cast<uintptr_t>(storage.release());
+    handle->destroy_addr = &destroy_quantizer_view<T>;
+    handle->dtype        = dtype;
+    handle->is_owning    = false;
+    *output              = handle.release();
+  } catch (...) {
+    RAFT_CUDA_TRY_NO_THROW(cudaFree(device_norm_sq));
+    throw;
+  }
 }
 
 }  // namespace

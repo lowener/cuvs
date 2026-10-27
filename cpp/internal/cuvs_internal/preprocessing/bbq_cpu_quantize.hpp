@@ -334,11 +334,12 @@ inline auto copy_bbq_quantizer_host_to_device(raft::resources const& res,
 {
   cuvs::preprocessing::quantize::bbq::quantizer<float> device{
     res, static_cast<uint32_t>(host_storage.centroid.extent(0))};
+  auto stream = raft::resource::get_cuda_stream(res);
   raft::copy(device.centroid.data_handle(),
              host_storage.centroid.data_handle(),
              device.centroid.size(),
-             raft::resource::get_cuda_stream(res));
-  device.centroid_norm_sq = host_storage.centroid_norm_sq;
+             stream);
+  raft::copy(device.centroid_norm_sq.data_handle(), &host_storage.centroid_norm_sq, 1, stream);
   return device;
 }
 

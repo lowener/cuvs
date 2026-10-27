@@ -499,11 +499,11 @@ __device__ __forceinline__ float bbq_calculate_metric(
       d = sqrtf(d);
     }
   } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-    d = -(centered + corrections - storage_document.quantizer.centroid_norm_sq);
+    d = -(centered + corrections - storage_document.quantizer.centroid_norm_sq(0));
   } else {  // CosineExpanded
     const float norm_product =
       storage_document.row_norm(document_id) * storage_query.row_norm(query_id);
-    const float dot = centered + corrections - storage_document.quantizer.centroid_norm_sq;
+    const float dot = centered + corrections - storage_document.quantizer.centroid_norm_sq(0);
     d               = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
   }
   return dist_epilogue(d, document_id, query_id);
