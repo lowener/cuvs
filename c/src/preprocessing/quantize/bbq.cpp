@@ -12,9 +12,10 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
 #include <raft/core/mdspan_types.hpp>
+#include <raft/core/interruptible.hpp>
 #include <raft/util/cudart_utils.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream_ref>
 
 #include <cstdint>
 #include <memory>
@@ -129,9 +130,11 @@ void make_and_bind_quantizer_view(
   float* device_norm_sq = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&device_norm_sq, sizeof(float)));
   try {
-    auto stream = rmm::cuda_stream_default;
+    // The C API doesn't take a stream, so construct one to copy the norm to device memory
+    // This is a temporary workaround until the C API takes a stream.
+    const cuda::stream_ref stream{cudaStream_t{}};
     raft::copy(device_norm_sq, &centroid_norm_sq, 1, stream);
-    stream.sync();
+    raft::interruptible::synchronize(stream);
 
     auto storage = std::make_unique<storage_t>(make_cpp_quantizer_view<T>(
       codes,

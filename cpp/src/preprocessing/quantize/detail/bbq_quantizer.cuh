@@ -135,7 +135,7 @@ __device__ inline float interval_loss(const float* row_ptr,
   const float lower    = interval.x;
   const float upper    = interval.y;
   const MathT step     = static_cast<MathT>((upper - lower) / (points - MathT(1.0f)));
-  const MathT step_inv = MathT(1.0f) / step;
+  const MathT step_inv = upper == lower ? MathT(0.0f) : MathT(1.0f) / step;
   MathT xe             = 0.0f;
   MathT e              = 0.0f;
 
@@ -186,13 +186,14 @@ __device__ inline float2 optimize_intervals(float2 interval,
                                             float lambda,
                                             int iters)
 {
-  float initial_loss =
-    interval_loss<MathT>(row_ptr, centroid, dim, interval, points, norm2, lambda);
   const float scale = (1.0f - lambda) / norm2;
   if (!::isfinite(scale)) { return interval; }
+  float initial_loss =
+    interval_loss<MathT>(row_ptr, centroid, dim, interval, points, norm2, lambda);
   for (int i = 0; i < iters; ++i) {
-    const float lower    = interval.x;
-    const float upper    = interval.y;
+    const float lower = interval.x;
+    const float upper = interval.y;
+    if (upper == lower) { return interval; }
     const float step_inv = (points - 1.0f) / (upper - lower);
     MathT daa = 0.0f, dab = 0.0f, dbb = 0.0f, dax = 0.0f, dbx = 0.0f;
     auto accumulate = [&](float xi) {
@@ -347,6 +348,8 @@ __global__ void quantize_kernel(
   const float lower = interval.x;
   const float upper = interval.y;
   const float step  = (upper - lower) / n_steps;
+  // Quantizes every component to code 0 if the interval is equal.
+  const bool equal_interval = upper == lower;
   uint8_t* code_row =
     out.codes + static_cast<size_t>(row_id) * static_cast<size_t>(out.code_row_length);
   int component_sum = 0;
@@ -356,7 +359,7 @@ __global__ void quantize_kernel(
     uint32_t code    = 0;
     if (d < dim) {
       const float xi = clamp(row_ptr[d] - centroid[d], lower, upper);
-      code           = static_cast<uint32_t>(lucene_round((xi - lower) / step));
+      code = equal_interval ? 0u : static_cast<uint32_t>(lucene_round((xi - lower) / step));
       component_sum += static_cast<int>(code);
     }
     write_code_group<Layout>(code_row, dim, base, code);
