@@ -10,6 +10,7 @@
 #include <raft/random/rng.cuh>
 #include <raft/util/cudart_utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <ostream>
@@ -170,7 +171,7 @@ class BbqQuantizationTest : public ::testing::TestWithParam<BbqQuantizationInput
     if (params_.query_layout != params_.doc_layout) { layouts.push_back(params_.query_layout); }
     ASSERT_EQ(encoded.storages.size(), layouts.size());
 
-    const auto encoded_view = encoded.as_dataset_view();
+    const auto encoded_view = encoded.view();
     for (const auto layout : layouts) {
       ASSERT_TRUE(encoded.has_layout(layout));
       const auto expected =
@@ -255,12 +256,20 @@ class BbqQuantizationTest : public ::testing::TestWithParam<BbqQuantizationInput
                                         cuvs::Compare<int32_t>(),
                                         kMinMatchFraction,
                                         stream));
-    ASSERT_TRUE(devArrMatchHostFraction(expected.codes.data_handle(),
-                                        actual.codes.data_handle(),
-                                        actual.codes.size(),
-                                        cuvs::Compare<uint8_t>(),
-                                        kMinMatchFraction,
-                                        stream));
+    const auto row_length = static_cast<size_t>(actual.codes.extent(1));
+    int64_t matching_rows = 0;
+    for (int64_t i = 0; i < rows_; ++i) {
+      const auto offset = static_cast<size_t>(i) * row_length;
+      if (devArrMatchHost(expected.codes.data_handle() + offset,
+                          actual.codes.data_handle() + offset,
+                          row_length,
+                          cuvs::Compare<uint8_t>(),
+                          stream)) {
+        ++matching_rows;
+      }
+    }
+    ASSERT_GE(static_cast<float>(matching_rows), kMinMatchFraction * static_cast<float>(rows_))
+      << matching_rows << " of " << rows_ << " rows of codes match";
   }
 
   void SetUp() override

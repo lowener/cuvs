@@ -128,7 +128,9 @@ struct quantizer_view;
  */
 template <typename DataT>
 struct quantizer {
+  /** Centroid shared by every row; rows are encoded relative to it. */
   raft::device_vector<DataT, int64_t> centroid;
+  /** Squared L2 norm of the centroid, ||c||^2. */
   raft::device_scalar<float, int64_t> centroid_norm_sq;
 
   quantizer(raft::resources const& res, uint32_t dim)
@@ -144,9 +146,20 @@ struct quantizer {
   }
 };
 
+/**
+ * @brief Non-owning view of a BBQ quantizer, through which a storage reads the centroid its rows
+ * are encoded against.
+ *
+ * The view owns neither the centroid nor its norm, so the quantizer it was taken from has to
+ * outlive it.
+ *
+ * @tparam DataT data element type
+ */
 template <typename DataT>
 struct quantizer_view {
+  /** Centroid shared by every row; rows are encoded relative to it. */
   raft::device_vector_view<const DataT, int64_t> centroid;
+  /** Squared L2 norm of the centroid, ||c||^2. */
   raft::device_scalar_view<const float, int64_t> centroid_norm_sq;
 
   constexpr auto dim() const noexcept -> uint32_t
@@ -227,19 +240,40 @@ struct bbq_dataset_owning_storage {
   }
 };
 
+/**
+ * @brief Non-owning view of a dataset encoded by a BBQ quantizer in one code layout, as consumed by
+ * search.
+ *
+ * The view owns none of the arrays it refers to, and reads the centroid through `quantizer`: both
+ * the arrays and the quantizer the rows were encoded against have to outlive it.
+ *
+ * @tparam DataT data element type
+ * @tparam IdxT row index type
+ */
 template <typename DataT, typename IdxT>
 struct bbq_dataset_view_storage {
+  /** View of the quantizer the rows were encoded against. */
   quantizer_view<DataT> quantizer;
+  /** Encoded rows, `get_encoded_row_length(dim, layout)` bytes per row. */
   raft::device_matrix_view<const uint8_t, IdxT> codes;
+  /** Per-row lower bound of the quantization interval, relative to the centroid. */
   raft::device_vector_view<const float, IdxT> lower_intervals;
+  /** Per-row upper bound of the quantization interval, relative to the centroid. */
   raft::device_vector_view<const float, IdxT> upper_intervals;
+  /** Per-row correction: ||x - c||^2 for L2 metrics, x.c otherwise. */
   raft::device_vector_view<const float, IdxT> additional_corrections;
+  /** Per-row sum of the codes. */
   raft::device_vector_view<const int32_t, IdxT> quantized_component_sums;
+  /** Per-row step between consecutive codes: (upper - lower) / (2^bits - 1). */
   raft::device_vector_view<const float, IdxT> dequant_delta;
+  /** Per-row dequant_delta * quantized_component_sums. */
   raft::device_vector_view<const float, IdxT> dequant_sum_delta;
+  /** Per-row squared norm in the original (un-centered) vector space, ||x||^2. */
   raft::device_vector_view<const float, IdxT> row_norm;
 
+  /** Code layout of `codes`. */
   bbq_code_layout layout{bbq_code_layout::packed_1b};
+  /** Metric the additional corrections were computed for. */
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
 
   bbq_dataset_view_storage(quantizer_view<DataT> quantizer_,
@@ -440,6 +474,11 @@ inline constexpr bool is_bbq_dataset_view_v =
 namespace preprocessing::quantize::bbq {
 
 /**
+ * @addtogroup bbq
+ * @{
+ */
+
+/**
  * @brief Builds a BBQ quantizer from a dataset: computes the centroid shared by every row.
  *
  * Usage example:
@@ -484,6 +523,8 @@ cuvs::neighbors::device_bbq_dataset<float, int64_t> transform(
   const params params,
   quantizer_view<float> quantizer,
   raft::device_matrix_view<const float, int64_t> dataset);
+
+/** @} */  // end of bbq group
 
 }  // namespace preprocessing::quantize::bbq
 }  // namespace CUVS_EXPORT cuvs

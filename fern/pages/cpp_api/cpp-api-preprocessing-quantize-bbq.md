@@ -110,7 +110,7 @@ RaBitQ and BBQ in cuVS both compress centroid-relative vectors to low-bit codes 
 template <typename DataT>
 struct quantizer {
   raft::device_vector<DataT, int64_t> centroid;
-  float centroid_norm_sq;
+  raft::device_scalar<float, int64_t> centroid_norm_sq;
 };
 ```
 
@@ -118,8 +118,30 @@ struct quantizer {
 
 | Name | Type | Description |
 | --- | --- | --- |
-| `centroid` | `raft::device_vector<DataT, int64_t>` |  |
-| `centroid_norm_sq` | `float` |  |
+| `centroid` | `raft::device_vector<DataT, int64_t>` | Centroid shared by every row; rows are encoded relative to it. |
+| `centroid_norm_sq` | `raft::device_scalar<float, int64_t>` | Squared L2 norm of the centroid, \|\|c\|\|^2. |
+
+<a id="preprocessing-quantize-bbq-quantizer-view"></a>
+### preprocessing::quantize::bbq::quantizer_view
+
+Non-owning view of a BBQ quantizer, through which a storage reads the centroid its rows are encoded against.
+
+The view owns neither the centroid nor its norm, so the quantizer it was taken from has to outlive it.
+
+```cpp
+template <typename DataT>
+struct quantizer_view {
+  raft::device_vector_view<const DataT, int64_t> centroid;
+  raft::device_scalar_view<const float, int64_t> centroid_norm_sq;
+};
+```
+
+**Fields**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `centroid` | `raft::device_vector_view<const DataT, int64_t>` | Centroid shared by every row; rows are encoded relative to it. |
+| `centroid_norm_sq` | `raft::device_scalar_view<const float, int64_t>` | Squared L2 norm of the centroid, \|\|c\|\|^2. |
 
 <a id="preprocessing-quantize-bbq-bbq-dataset-owning-storage"></a>
 ### preprocessing::quantize::bbq::bbq_dataset_owning_storage
@@ -152,7 +174,7 @@ struct bbq_dataset_owning_storage {
 | `dequant_delta` | `raft::device_vector<float, IdxT>` | Precomputed per-row dequantization factors, derived once (offline) from lower/upper_intervals and quantized_component_sums: dequant_delta = (upper-lower)/(2^bits-1) |
 | `dequant_sum_delta` | `raft::device_vector<float, IdxT>` | Precomputed per-row dequantization factors, derived once (offline) from dequant_delta and quantized_component_sums: dequant_sum_delta = dequant_delta * quantized_component_sums. |
 | `row_norm` | `raft::device_vector<float, IdxT>` | Squared norm of the row in original (un-centered) vector space, \|\|x\|\|^2 |
-| `quantizer` | `quantizer_view<DataT>` |  |
+| `quantizer` | [`quantizer_view<DataT>`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-quantizer-view) |  |
 | `codes` | `raft::device_matrix<uint8_t, IdxT>` |  |
 | `lower_intervals` | `raft::device_vector<float, IdxT>` |  |
 | `upper_intervals` | `raft::device_vector<float, IdxT>` |  |
@@ -160,6 +182,46 @@ struct bbq_dataset_owning_storage {
 | `quantized_component_sums` | `raft::device_vector<int32_t, IdxT>` |  |
 | `layout` | [`bbq_code_layout`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-bbq-code-layout) |  |
 | `metric` | [`cuvs::distance::DistanceType`](/api-reference/cpp-api-distance-distance#distance-distancetype) |  |
+
+<a id="preprocessing-quantize-bbq-bbq-dataset-view-storage"></a>
+### preprocessing::quantize::bbq::bbq_dataset_view_storage
+
+Non-owning view of a dataset encoded by a BBQ quantizer in one code layout, as consumed by search.
+
+The view owns none of the arrays it refers to, and reads the centroid through `quantizer`: both the arrays and the quantizer the rows were encoded against have to outlive it.
+
+```cpp
+template <typename DataT, typename IdxT>
+struct bbq_dataset_view_storage {
+  quantizer_view<DataT> quantizer;
+  raft::device_matrix_view<const uint8_t, IdxT> codes;
+  raft::device_vector_view<const float, IdxT> lower_intervals;
+  raft::device_vector_view<const float, IdxT> upper_intervals;
+  raft::device_vector_view<const float, IdxT> additional_corrections;
+  raft::device_vector_view<const int32_t, IdxT> quantized_component_sums;
+  raft::device_vector_view<const float, IdxT> dequant_delta;
+  raft::device_vector_view<const float, IdxT> dequant_sum_delta;
+  raft::device_vector_view<const float, IdxT> row_norm;
+  bbq_code_layout layout;
+  cuvs::distance::DistanceType metric;
+};
+```
+
+**Fields**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `quantizer` | [`quantizer_view<DataT>`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-quantizer-view) | View of the quantizer the rows were encoded against. |
+| `codes` | `raft::device_matrix_view<const uint8_t, IdxT>` | Encoded rows, `get_encoded_row_length(dim, layout)` bytes per row. |
+| `lower_intervals` | `raft::device_vector_view<const float, IdxT>` | Per-row lower bound of the quantization interval, relative to the centroid. |
+| `upper_intervals` | `raft::device_vector_view<const float, IdxT>` | Per-row upper bound of the quantization interval, relative to the centroid. |
+| `additional_corrections` | `raft::device_vector_view<const float, IdxT>` | Per-row correction: \|\|x - c\|\|^2 for L2 metrics, x.c otherwise. |
+| `quantized_component_sums` | `raft::device_vector_view<const int32_t, IdxT>` | Per-row sum of the codes. |
+| `dequant_delta` | `raft::device_vector_view<const float, IdxT>` | Per-row step between consecutive codes: (upper - lower) / (2^bits - 1). |
+| `dequant_sum_delta` | `raft::device_vector_view<const float, IdxT>` | Per-row dequant_delta * quantized_component_sums. |
+| `row_norm` | `raft::device_vector_view<const float, IdxT>` | Per-row squared norm in the original (un-centered) vector space, \|\|x\|\|^2. |
+| `layout` | [`bbq_code_layout`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-bbq-code-layout) | Code layout of `codes`. |
+| `metric` | [`cuvs::distance::DistanceType`](/api-reference/cpp-api-distance-distance#distance-distancetype) | Metric the additional corrections were computed for. |
 
 <a id="preprocessing-quantize-bbq-helpers-resolve-dequant-factors"></a>
 ### preprocessing::quantize::bbq::helpers::resolve_dequant_factors
@@ -194,3 +256,58 @@ dequant_sum_delta from that delta and quantized_component_sums.
 **Returns**
 
 `void`
+
+<a id="preprocessing-quantize-bbq-build"></a>
+### preprocessing::quantize::bbq::build
+
+Builds a BBQ quantizer from a dataset: computes the centroid shared by every row.
+
+```cpp
+quantizer<float> build(raft::resources const& res,
+raft::device_matrix_view<const float, int64_t> dataset);
+```
+
+Usage example:
+
+**Parameters**
+
+| Name | Direction | Type | Description |
+| --- | --- | --- | --- |
+| `res` | in | `raft::resources const&` | raft resource |
+| `dataset` | in | `raft::device_matrix_view<const float, int64_t>` | a row-major matrix view on device |
+
+**Returns**
+
+[`quantizer<float>`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-quantizer)
+
+<a id="preprocessing-quantize-bbq-transform"></a>
+### preprocessing::quantize::bbq::transform
+
+Encodes a dataset with a built BBQ quantizer into a BBQ dataset.
+
+```cpp
+cuvs::neighbors::device_bbq_dataset<float, int64_t> transform(
+raft::resources const& res,
+const params params,
+quantizer_view<float> quantizer,
+raft::device_matrix_view<const float, int64_t> dataset);
+```
+
+The dataset holds its own copy of the centroid `quantizer` refers to, and one or two storages depending on `params.doc_layout` and `params.query_layout`.
+
+Usage example:
+
+**Parameters**
+
+| Name | Direction | Type | Description |
+| --- | --- | --- | --- |
+| `res` | in | `raft::resources const&` | raft resource |
+| `params` | in | [`const params`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-params) | configuration for BBQ encoding, e.g. doc_layout, query_layout, metric, lambda, iters |
+| `quantizer` | in | [`quantizer_view<float>`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-quantizer-view) | a view of a BBQ quantizer returned by `build` |
+| `dataset` | in | `raft::device_matrix_view<const float, int64_t>` | a row-major matrix view on device |
+
+**Returns**
+
+`cuvs::neighbors::device_bbq_dataset<float, int64_t>`
+
+the encoded dataset
