@@ -10,6 +10,7 @@
 #include <cuvs/distance/distance.h>
 
 #include <dlpack/dlpack.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,6 +25,9 @@ extern "C" {
 
 /**
  * Storage layout of BBQ/OSQ quantized component codes in each dataset row.
+ *
+ * The numeric values are part of the ABI: they never change, and new layouts are only appended.
+ *
  * CUVS_BBQ_CODE_LAYOUT_PACKED_1B: Each dimension is quantized to a single bit and packed into bytes. Reflects
  * Lucene's OptimizedScalarQuantizer.packAsBinary.
  * CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_2B: Each dimension is quantized to 2 bits, stored as 2 bitplanes.
@@ -40,14 +44,77 @@ extern "C" {
  * CUVS_BBQ_CODE_LAYOUT_PACKED_8B: Each dimension is quantized to 8 bits and treated as an unsigned value.
  */
 typedef enum {
-  CUVS_BBQ_CODE_LAYOUT_PACKED_1B = 0,
-  CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_2B,
-  CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B,
-  CUVS_BBQ_CODE_LAYOUT_PACKED_4B,
-  CUVS_BBQ_CODE_LAYOUT_PACKED_7B,
-  CUVS_BBQ_CODE_LAYOUT_PACKED_8B
+  CUVS_BBQ_CODE_LAYOUT_PACKED_1B     = 0,
+  CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_2B = 1,
+  CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B = 2,
+  CUVS_BBQ_CODE_LAYOUT_PACKED_4B     = 3,
+  CUVS_BBQ_CODE_LAYOUT_PACKED_7B     = 4,
+  CUVS_BBQ_CODE_LAYOUT_PACKED_8B     = 5
 } cuvsBbqCodeLayout_t;
 
+/**
+ * @brief Parameters of a BBQ quantizer.
+ *
+ * Always allocate this struct with `cuvsBbqQuantizerParamsCreate` and release it with
+ * `cuvsBbqQuantizerParamsDestroy`: new fields may be appended in later releases, so declaring it on
+ * the stack or with `malloc` is not ABI-stable.
+ *
+ * The set of layouts a quantizer encodes must be one a BBQ dataset supports: a single layout
+ * (`doc_layout == query_layout`) other than `CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B`, or one of the
+ * (document, query) pairs (`PACKED_1B`, `PACKED_4B`), (`PACKED_1B`, `TRANSPOSED_2B`),
+ * (`PACKED_1B`, `TRANSPOSED_4B`), (`TRANSPOSED_2B`, `TRANSPOSED_4B`).
+ */
+struct cuvsBbqQuantizerParams {
+  /**
+   * Code layout of the encoded rows on the document side of a distance.
+   * Default: `CUVS_BBQ_CODE_LAYOUT_PACKED_1B`.
+   */
+  cuvsBbqCodeLayout_t doc_layout;
+  /**
+   * Code layout of the encoded rows on the query side of a distance. When it differs from
+   * `doc_layout`, the dataset is encoded a second time in this layout.
+   * Default: `CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B`.
+   */
+  cuvsBbqCodeLayout_t query_layout;
+  /**
+   * Distance metric the encoded dataset is compared with. Selects the per-row additional
+   * correction: ||x - c||^2 for `L2Expanded` and `L2SqrtExpanded`, x.c otherwise.
+   * Default: `L2Expanded`.
+   */
+  cuvsDistanceType metric;
+  /**
+   * Weight of the quantization error against the norm-preserving term of the interval loss, within
+   * [0, 1]. Default: 0.1.
+   */
+  float lambda;
+  /**
+   * Coordinate-descent iterations refining the quantization interval of each row. Zero keeps the
+   * initial interval. Default: 5.
+   */
+  uint32_t iters;
+};
+
+typedef struct cuvsBbqQuantizerParams* cuvsBbqQuantizerParams_t;
+
+/**
+ * @brief Allocate BBQ quantizer params, and populate them with default values.
+ *
+ * Release with `cuvsBbqQuantizerParamsDestroy`.
+ *
+ * @param[out] params newly allocated params
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerParamsCreate(cuvsBbqQuantizerParams_t* params);
+
+/**
+ * @brief De-allocate BBQ quantizer params.
+ *
+ * Accepts NULL.
+ *
+ * @param[in] params params to destroy
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerParamsDestroy(cuvsBbqQuantizerParams_t params);
 
 /**
  * @brief Better Binary Quantization
@@ -67,14 +134,155 @@ typedef enum {
  * in transformation and scale representation. RaBitQ commonly separates residual magnitude from
  * direction, then applies a random orthogonal rotation before binary coding; BBQ uses per-vector
  * scalar intervals to interpret the compressed residual codes.
+ *
+ * A handle is obtained in one of two ways, and `is_owning` tells them apart:
+ * - `cuvsBbqQuantizerCreate` followed by `cuvsBbqQuantizerBuild` yields an owning quantizer: it
+ *   holds the centroid it computed and its parameters, and encodes datasets with
+ *   `cuvsBbqQuantizerTransform`.
+ * - `cuvsBbqQuantizerCreateView` yields a non-owning quantizer over rows that were already encoded,
+ *   for example by Lucene, to be assembled into a dataset with `cuvsDatasetMakeBbqView`.
+ *
+ * Either kind is released with `cuvsBbqQuantizerDestroy`. The fields are managed by cuVS; read
+ * them through the `cuvsBbqQuantizerGet*` functions and never allocate or modify the struct
+ * directly.
  */
 typedef struct cuvsBbqQuantizer {
+  /** Opaque pointer to the implementation state. */
   uintptr_t addr;
+  /** Releases `addr`; called by `cuvsBbqQuantizerDestroy`. */
   void (*destroy_addr)(void*);
+  /** Element type of the centroid. */
   DLDataType dtype;
+  /** Whether the handle owns the state it refers to, as opposed to viewing caller-owned tensors. */
   bool is_owning;
 } cuvsBbqQuantizer;
 typedef cuvsBbqQuantizer* cuvsBbqQuantizer_t;
+
+/**
+ * @brief Allocate an empty, owning BBQ quantizer to be built with `cuvsBbqQuantizerBuild`.
+ *
+ * Release with `cuvsBbqQuantizerDestroy`.
+ *
+ * @param[out] quantizer newly allocated quantizer handle
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerCreate(cuvsBbqQuantizer_t* quantizer);
+
+/**
+ * @brief Build a BBQ quantizer from a dataset: compute the centroid shared by every row.
+ *
+ * The quantizer keeps a copy of `params`, which `cuvsBbqQuantizerTransform` encodes with. This
+ * function synchronizes the stream of `res`.
+ *
+ * @code{.c}
+ * #include <cuvs/core/c_api.h>
+ * #include <cuvs/core/dataset.h>
+ * #include <cuvs/preprocessing/quantize/bbq.h>
+ *
+ * cuvsResources_t res;
+ * cuvsResourcesCreate(&res);
+ *
+ * // A row-major float32 matrix in device memory
+ * DLManagedTensor *dataset;
+ *
+ * cuvsBbqQuantizerParams_t params;
+ * cuvsBbqQuantizerParamsCreate(&params);
+ *
+ * cuvsBbqQuantizer_t quantizer;
+ * cuvsBbqQuantizerCreate(&quantizer);
+ * cuvsBbqQuantizerBuild(res, params, dataset, quantizer);
+ *
+ * cuvsDataset_t bbq_dataset;
+ * cuvsDatasetCreate(&bbq_dataset);
+ * cuvsBbqQuantizerTransform(res, quantizer, dataset, bbq_dataset);
+ *
+ * // bbq_dataset can now be passed to cuvsCagraBuild
+ *
+ * cuvsDatasetDestroy(bbq_dataset);
+ * cuvsBbqQuantizerDestroy(quantizer);
+ * cuvsBbqQuantizerParamsDestroy(params);
+ * cuvsResourcesDestroy(res);
+ * @endcode
+ *
+ * @param[in] res cuVS resources
+ * @param[in] params quantizer parameters
+ * @param[in] dataset non-empty, row-major float32 matrix in device-accessible memory
+ * @param[in,out] quantizer empty quantizer from `cuvsBbqQuantizerCreate`; a quantizer can only be
+ * built once
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerBuild(cuvsResources_t res,
+                                              cuvsBbqQuantizerParams_t params,
+                                              DLManagedTensor* dataset,
+                                              cuvsBbqQuantizer_t quantizer);
+
+/**
+ * @brief Encode a dataset with a built BBQ quantizer into a new owning BBQ dataset.
+ *
+ * The rows are encoded in the quantizer's `doc_layout`, and again in its `query_layout` when it
+ * differs. The resulting dataset has layout `CUVS_DATASET_LAYOUT_BBQ`, resides in device memory,
+ * owns a copy of the centroid, and does not reference `quantizer` or `dataset` afterwards. The work
+ * is ordered on the stream of `res`.
+ *
+ * @param[in] res cuVS resources
+ * @param[in] quantizer quantizer built with `cuvsBbqQuantizerBuild`
+ * @param[in] dataset non-empty, row-major float32 matrix in device-accessible memory, with as many
+ * columns as the quantizer's dimension
+ * @param[in,out] bbq_dataset empty dataset handle from `cuvsDatasetCreate`, filled with the encoded
+ * dataset; release it with `cuvsDatasetDestroy`
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerTransform(cuvsResources_t res,
+                                                  cuvsBbqQuantizer_t quantizer,
+                                                  DLManagedTensor* dataset,
+                                                  cuvsDataset_t bbq_dataset);
+
+/**
+ * @brief Get the dimension of the vectors a BBQ quantizer encodes.
+ *
+ * @param[in] quantizer built or view quantizer
+ * @param[out] dim number of components of each vector
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerGetDim(cuvsBbqQuantizer_t quantizer, uint32_t* dim);
+
+/**
+ * @brief Get a non-owning view of the centroid of a BBQ quantizer.
+ *
+ * The tensor points to device memory that stays valid as long as `quantizer` (or, for a view
+ * quantizer, the caller's centroid tensor) does. Call `centroid->deleter` once done with it to
+ * release the tensor's shape metadata.
+ *
+ * @param[in] quantizer built or view quantizer
+ * @param[out] centroid one-dimensional device tensor of `dim` elements of the quantizer's dtype
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerGetCentroid(cuvsBbqQuantizer_t quantizer,
+                                                    DLManagedTensor* centroid);
+
+/**
+ * @brief Get the squared L2 norm of the centroid of a BBQ quantizer.
+ *
+ * @param[in] quantizer built or view quantizer
+ * @param[out] centroid_norm_sq squared norm of the centroid
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerGetCentroidNormSq(cuvsBbqQuantizer_t quantizer,
+                                                          float* centroid_norm_sq);
+
+/**
+ * @brief Get the number of bytes one encoded row occupies in a code layout.
+ *
+ * Gives the column count of the `codes` matrix passed to `cuvsBbqQuantizerCreateView`.
+ *
+ * @param[in] dim number of components of each vector
+ * @param[in] layout code layout
+ * @param[out] row_length bytes per encoded row
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqGetEncodedRowLength(uint32_t dim,
+                                                   cuvsBbqCodeLayout_t layout,
+                                                   uint32_t* row_length);
 
 /**
  * @brief Create a BBQ quantizer view from caller-owned device tensors.
@@ -112,7 +320,10 @@ CUVS_EXPORT cuvsError_t cuvsBbqQuantizerCreateView(
   cuvsBbqQuantizer_t* quantizer);
 
 /**
- * @brief Destroy a BBQ quantizer without destroying its caller-owned tensors.
+ * @brief Destroy a BBQ quantizer.
+ *
+ * Releases the state of a quantizer from `cuvsBbqQuantizerCreate`; the caller-owned tensors of a
+ * quantizer from `cuvsBbqQuantizerCreateView` are left untouched. Accepts NULL.
  *
  * @param[in] quantizer quantizer handle to destroy
  * @return cuvsError_t
@@ -122,7 +333,9 @@ CUVS_EXPORT cuvsError_t cuvsBbqQuantizerDestroy(cuvsBbqQuantizer_t quantizer);
 /**
  * @brief Create a non-owning device BBQ dataset view.
  *
- * Accepts one symmetric quantizer or two compatible asymmetric quantizers.
+ * Accepts one symmetric quantizer or two compatible asymmetric quantizers, all created with
+ * `cuvsBbqQuantizerCreateView`. A dataset encoded by `cuvsBbqQuantizerTransform` is already a BBQ
+ * dataset and does not go through this function.
  *
  * @param[in] res cuVS resources
  * @param[in] quantizers array containing one or two BBQ quantizer handles
