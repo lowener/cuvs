@@ -397,8 +397,13 @@ static void with_dataset_view(cuvsDataset_t dataset, Fn&& fn)
   RAFT_EXPECTS(dataset->addr != 0, "null dataset storage");
   if (dataset->is_owning) {
     auto* owner = reinterpret_cast<OwnerT*>(dataset->addr);
-    auto view   = std::as_const(*owner).view();
-    fn(view);
+    if constexpr (cuvs::neighbors::is_bbq_dataset_v<OwnerT>) {
+      auto view = owner->view();
+      fn(view);
+    } else {
+      auto view = std::as_const(*owner).view();
+      fn(view);
+    }
   } else {
     fn(*reinterpret_cast<ViewT*>(dataset->addr));
   }

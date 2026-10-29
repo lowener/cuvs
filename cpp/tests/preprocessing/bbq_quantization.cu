@@ -164,7 +164,7 @@ class BbqQuantizationTest : public ::testing::TestWithParam<BbqQuantizationInput
 
     const params p{params_.doc_layout, params_.query_layout, params_.metric};
     const auto quantizer = build(handle, dataset);
-    const auto encoded   = transform(handle, p, quantizer.view(), dataset);
+    auto encoded         = transform(handle, p, quantizer.view(), dataset);
     ASSERT_EQ(quantizer.dim(), cols_);
 
     std::vector<bbq_code_layout> layouts{params_.doc_layout};

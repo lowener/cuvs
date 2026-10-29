@@ -65,9 +65,9 @@ auto make_cpp_quantizer_view(
   using quantizer_view_t = cuvs::preprocessing::quantize::bbq::quantizer_view<T>;
   using storage_view_t =
     cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
-  using codes_view_t    = raft::device_matrix_view<const uint8_t, int64_t>;
-  using float_view_t    = raft::device_vector_view<const float, int64_t>;
-  using int_view_t      = raft::device_vector_view<const int32_t, int64_t>;
+  using codes_view_t    = raft::device_matrix_view<uint8_t, int64_t>;
+  using float_view_t    = raft::device_vector_view<float, int64_t>;
+  using int_view_t      = raft::device_vector_view<int32_t, int64_t>;
   using centroid_view_t = raft::device_vector_view<const T, int64_t>;
 
   auto codes       = cuvs::core::from_dlpack<codes_view_t>(codes_tensor);

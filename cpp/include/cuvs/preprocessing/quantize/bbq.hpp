@@ -224,7 +224,7 @@ struct bbq_dataset_owning_storage {
   {
     return get_encoded_row_length(dim(), layout);
   }
-  [[nodiscard]] auto view() const noexcept -> bbq_dataset_view_storage<DataT, IdxT>
+  [[nodiscard]] auto view() noexcept -> bbq_dataset_view_storage<DataT, IdxT>
   {
     return bbq_dataset_view_storage<DataT, IdxT>{quantizer,
                                                  codes.view(),
@@ -255,21 +255,21 @@ struct bbq_dataset_view_storage {
   /** View of the quantizer the rows were encoded against. */
   quantizer_view<DataT> quantizer;
   /** Encoded rows, `get_encoded_row_length(dim, layout)` bytes per row. */
-  raft::device_matrix_view<const uint8_t, IdxT> codes;
+  raft::device_matrix_view<uint8_t, IdxT> codes;
   /** Per-row lower bound of the quantization interval, relative to the centroid. */
-  raft::device_vector_view<const float, IdxT> lower_intervals;
+  raft::device_vector_view<float, IdxT> lower_intervals;
   /** Per-row upper bound of the quantization interval, relative to the centroid. */
-  raft::device_vector_view<const float, IdxT> upper_intervals;
+  raft::device_vector_view<float, IdxT> upper_intervals;
   /** Per-row correction: ||x - c||^2 for L2 metrics, x.c otherwise. */
-  raft::device_vector_view<const float, IdxT> additional_corrections;
+  raft::device_vector_view<float, IdxT> additional_corrections;
   /** Per-row sum of the codes. */
-  raft::device_vector_view<const int32_t, IdxT> quantized_component_sums;
+  raft::device_vector_view<int32_t, IdxT> quantized_component_sums;
   /** Per-row step between consecutive codes: (upper - lower) / (2^bits - 1). */
-  raft::device_vector_view<const float, IdxT> dequant_delta;
+  raft::device_vector_view<float, IdxT> dequant_delta;
   /** Per-row dequant_delta * quantized_component_sums. */
-  raft::device_vector_view<const float, IdxT> dequant_sum_delta;
+  raft::device_vector_view<float, IdxT> dequant_sum_delta;
   /** Per-row squared norm in the original (un-centered) vector space, ||x||^2. */
-  raft::device_vector_view<const float, IdxT> row_norm;
+  raft::device_vector_view<float, IdxT> row_norm;
 
   /** Code layout of `codes`. */
   bbq_code_layout layout{bbq_code_layout::packed_1b};
@@ -277,14 +277,14 @@ struct bbq_dataset_view_storage {
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
 
   bbq_dataset_view_storage(quantizer_view<DataT> quantizer_,
-                           raft::device_matrix_view<const uint8_t, IdxT> codes_,
-                           raft::device_vector_view<const float, IdxT> lower_intervals_,
-                           raft::device_vector_view<const float, IdxT> upper_intervals_,
-                           raft::device_vector_view<const float, IdxT> additional_corrections_,
-                           raft::device_vector_view<const int32_t, IdxT> quantized_component_sums_,
-                           raft::device_vector_view<const float, IdxT> dequant_delta_,
-                           raft::device_vector_view<const float, IdxT> dequant_sum_delta_,
-                           raft::device_vector_view<const float, IdxT> row_norm_,
+                           raft::device_matrix_view<uint8_t, IdxT> codes_,
+                           raft::device_vector_view<float, IdxT> lower_intervals_,
+                           raft::device_vector_view<float, IdxT> upper_intervals_,
+                           raft::device_vector_view<float, IdxT> additional_corrections_,
+                           raft::device_vector_view<int32_t, IdxT> quantized_component_sums_,
+                           raft::device_vector_view<float, IdxT> dequant_delta_,
+                           raft::device_vector_view<float, IdxT> dequant_sum_delta_,
+                           raft::device_vector_view<float, IdxT> row_norm_,
                            bbq_code_layout layout_,
                            cuvs::distance::DistanceType metric_) noexcept
     : quantizer{quantizer_},
@@ -345,7 +345,7 @@ struct dataset<bbq_dataset_container, DataT, IdxT, Accessor> {
   {
     add_storage(std::move(storage));
   }
-  [[nodiscard]] auto view() const noexcept
+  [[nodiscard]] auto view() noexcept
     -> dataset_view<bbq_dataset_container,
                     DataT,
                     IdxT,
@@ -384,9 +384,9 @@ struct dataset_view<bbq_dataset_container, DataT, IdxT, Accessor> {
 
   dataset_view() noexcept = default;
 
-  dataset_view(const std::vector<owning_storage_type>& storages_) noexcept
+  dataset_view(std::vector<owning_storage_type>& storages_) noexcept
   {
-    for (const auto& storage : storages_) {
+    for (auto& storage : storages_) {
       add_storage(storage);
     }
   }
@@ -404,7 +404,7 @@ struct dataset_view<bbq_dataset_container, DataT, IdxT, Accessor> {
     RAFT_EXPECTS(!has_layout(storage.layout), "Storage already exists with layout.");
     storages.push_back(storage);
   }
-  void add_storage(const owning_storage_type& storage)
+  void add_storage(owning_storage_type& storage)
   {
     RAFT_EXPECTS(!has_layout(storage.layout), "Storage already exists with layout.");
     storages.push_back(storage.view());

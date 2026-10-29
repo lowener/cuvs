@@ -194,14 +194,14 @@ The view owns none of the arrays it refers to, and reads the centroid through `q
 template <typename DataT, typename IdxT>
 struct bbq_dataset_view_storage {
   quantizer_view<DataT> quantizer;
-  raft::device_matrix_view<const uint8_t, IdxT> codes;
-  raft::device_vector_view<const float, IdxT> lower_intervals;
-  raft::device_vector_view<const float, IdxT> upper_intervals;
-  raft::device_vector_view<const float, IdxT> additional_corrections;
-  raft::device_vector_view<const int32_t, IdxT> quantized_component_sums;
-  raft::device_vector_view<const float, IdxT> dequant_delta;
-  raft::device_vector_view<const float, IdxT> dequant_sum_delta;
-  raft::device_vector_view<const float, IdxT> row_norm;
+  raft::device_matrix_view<uint8_t, IdxT> codes;
+  raft::device_vector_view<float, IdxT> lower_intervals;
+  raft::device_vector_view<float, IdxT> upper_intervals;
+  raft::device_vector_view<float, IdxT> additional_corrections;
+  raft::device_vector_view<int32_t, IdxT> quantized_component_sums;
+  raft::device_vector_view<float, IdxT> dequant_delta;
+  raft::device_vector_view<float, IdxT> dequant_sum_delta;
+  raft::device_vector_view<float, IdxT> row_norm;
   bbq_code_layout layout;
   cuvs::distance::DistanceType metric;
 };
@@ -212,14 +212,14 @@ struct bbq_dataset_view_storage {
 | Name | Type | Description |
 | --- | --- | --- |
 | `quantizer` | [`quantizer_view<DataT>`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-quantizer-view) | View of the quantizer the rows were encoded against. |
-| `codes` | `raft::device_matrix_view<const uint8_t, IdxT>` | Encoded rows, `get_encoded_row_length(dim, layout)` bytes per row. |
-| `lower_intervals` | `raft::device_vector_view<const float, IdxT>` | Per-row lower bound of the quantization interval, relative to the centroid. |
-| `upper_intervals` | `raft::device_vector_view<const float, IdxT>` | Per-row upper bound of the quantization interval, relative to the centroid. |
-| `additional_corrections` | `raft::device_vector_view<const float, IdxT>` | Per-row correction: \|\|x - c\|\|^2 for L2 metrics, x.c otherwise. |
-| `quantized_component_sums` | `raft::device_vector_view<const int32_t, IdxT>` | Per-row sum of the codes. |
-| `dequant_delta` | `raft::device_vector_view<const float, IdxT>` | Per-row step between consecutive codes: (upper - lower) / (2^bits - 1). |
-| `dequant_sum_delta` | `raft::device_vector_view<const float, IdxT>` | Per-row dequant_delta * quantized_component_sums. |
-| `row_norm` | `raft::device_vector_view<const float, IdxT>` | Per-row squared norm in the original (un-centered) vector space, \|\|x\|\|^2. |
+| `codes` | `raft::device_matrix_view<uint8_t, IdxT>` | Encoded rows, `get_encoded_row_length(dim, layout)` bytes per row. |
+| `lower_intervals` | `raft::device_vector_view<float, IdxT>` | Per-row lower bound of the quantization interval, relative to the centroid. |
+| `upper_intervals` | `raft::device_vector_view<float, IdxT>` | Per-row upper bound of the quantization interval, relative to the centroid. |
+| `additional_corrections` | `raft::device_vector_view<float, IdxT>` | Per-row correction: \|\|x - c\|\|^2 for L2 metrics, x.c otherwise. |
+| `quantized_component_sums` | `raft::device_vector_view<int32_t, IdxT>` | Per-row sum of the codes. |
+| `dequant_delta` | `raft::device_vector_view<float, IdxT>` | Per-row step between consecutive codes: (upper - lower) / (2^bits - 1). |
+| `dequant_sum_delta` | `raft::device_vector_view<float, IdxT>` | Per-row dequant_delta * quantized_component_sums. |
+| `row_norm` | `raft::device_vector_view<float, IdxT>` | Per-row squared norm in the original (un-centered) vector space, \|\|x\|\|^2. |
 | `layout` | [`bbq_code_layout`](/api-reference/cpp-api-preprocessing-quantize-bbq#preprocessing-quantize-bbq-bbq-code-layout) | Code layout of `codes`. |
 | `metric` | [`cuvs::distance::DistanceType`](/api-reference/cpp-api-distance-distance#distance-distancetype) | Metric the additional corrections were computed for. |
 
