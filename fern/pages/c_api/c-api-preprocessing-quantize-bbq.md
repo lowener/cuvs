@@ -139,7 +139,7 @@ size_t num_quantizers,
 cuvsDataset_t* dataset);
 ```
 
-Accepts one symmetric quantizer or two compatible asymmetric quantizers. The dataset, and any index built from it, refers to the quantizers' data, so the quantizer handles must outlive them.
+Accepts one symmetric quantizer or two compatible asymmetric quantizers. Both asymmetric quantizers must encode the same rows, in the same order, against the same centroid. The dataset, and any index built from it, refers to the quantizers' data, so the quantizer handles must outlive them.
 
 **Parameters**
 

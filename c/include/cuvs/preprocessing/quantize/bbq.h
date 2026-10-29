@@ -91,7 +91,13 @@ typedef cuvsBbqQuantizer* cuvsBbqQuantizer_t;
  *                            centroid_norm_sq, &quantizer);
  * cuvsDataset_t dataset;
  * cuvsDatasetMakeBbqView(res, &quantizer, 1, &dataset);
- * // ... build and search with `dataset` ...
+ * cuvsCagraIndex_t index;
+ * cuvsCagraIndexCreate(&index);
+ * cuvsCagraBuild(res, index_params, dataset, index);  // builds a graph-only index
+ * // Attach a device padded or PQ dataset before searching.
+ * cuvsCagraUpdateDataset(res, search_dataset, index);
+ * cuvsCagraSearch(res, search_params, index, &queries, &neighbors, &distances, filter);
+ * cuvsCagraIndexDestroy(index);
  * cuvsDatasetDestroy(dataset);         // destroy derived datasets and indexes first,
  * cuvsBbqQuantizerDestroy(quantizer);  // then the quantizer, then the tensors
  * @endcode
@@ -140,8 +146,10 @@ CUVS_EXPORT cuvsError_t cuvsBbqQuantizerDestroy(cuvsBbqQuantizer_t quantizer);
 /**
  * @brief Create a non-owning device BBQ dataset view.
  *
- * Accepts one symmetric quantizer or two compatible asymmetric quantizers. The dataset, and any
- * index built from it, refers to the quantizers' data, so the quantizer handles must outlive them.
+ * Accepts one symmetric quantizer or two compatible asymmetric quantizers. Both asymmetric
+ * quantizers must encode the same rows, in the same order, against the same centroid. The dataset,
+ * and any index built from it, refers to the quantizers' data, so the quantizer handles must
+ * outlive them.
  *
  * @param[in] res cuVS resources
  * @param[in] quantizers array containing one or two BBQ quantizer handles
