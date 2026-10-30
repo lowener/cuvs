@@ -43,7 +43,61 @@ auto to_cpp_layout(cuvsBbqCodeLayout_t layout)
     case CUVS_BBQ_CODE_LAYOUT_PACKED_7B: return layout_t::packed_7b;
     case CUVS_BBQ_CODE_LAYOUT_PACKED_8B: return layout_t::packed_8b;
   }
-  RAFT_FAIL("cuvsBbqQuantizerCreateView: invalid BBQ code layout");
+  RAFT_FAIL("Invalid BBQ code layout %d", static_cast<int>(layout));
+}
+
+template <typename T>
+void destroy_owned(void* ptr)
+{
+  delete reinterpret_cast<T*>(ptr);
+}
+
+auto to_cpp_params(cuvsBbqQuantizerParams const& params)
+  -> cuvs::preprocessing::quantize::bbq::params
+{
+  return cuvs::preprocessing::quantize::bbq::params{
+    to_cpp_layout(params.doc_layout),
+    to_cpp_layout(params.query_layout),
+    static_cast<cuvs::distance::DistanceType>(params.metric),
+    params.lambda,
+    params.iters};
+}
+
+auto float_dataset_from_dlpack(DLManagedTensor* dataset_tensor, const char* caller)
+  -> raft::device_matrix_view<const float, int64_t, raft::row_major>
+{
+  RAFT_EXPECTS(dataset_tensor != nullptr, "%s: null dataset", caller);
+  const auto& dataset = dataset_tensor->dl_tensor;
+  RAFT_EXPECTS(dataset.dtype.code == kDLFloat && dataset.dtype.bits == 32,
+               "%s: unsupported dataset dtype: code=%d, bits=%d",
+               caller,
+               dataset.dtype.code,
+               dataset.dtype.bits);
+  RAFT_EXPECTS(cuvs::core::is_dlpack_device_compatible(dataset),
+               "%s: dataset must be accessible on device memory",
+               caller);
+  return cuvs::core::from_dlpack<raft::device_matrix_view<const float, int64_t, raft::row_major>>(
+    dataset_tensor);
+}
+
+/** Centroid of a quantizer from cuvsBbqQuantizerBuild, or of a float32 quantizer view. */
+auto get_cpp_centroid_view(cuvsBbqQuantizer_t quantizer)
+  -> cuvs::preprocessing::quantize::bbq::quantizer_view<float>
+{
+  RAFT_EXPECTS(quantizer != nullptr && quantizer->addr != 0,
+               "cuvsBbqQuantizerTransform: null quantizer");
+  RAFT_EXPECTS(quantizer->dtype.code == kDLFloat && quantizer->dtype.bits == 32,
+               "cuvsBbqQuantizerTransform: unsupported centroid dtype: code=%d, bits=%d",
+               quantizer->dtype.code,
+               quantizer->dtype.bits);
+  if (quantizer->is_owning) {
+    return reinterpret_cast<cuvs::preprocessing::quantize::bbq::quantizer<float>*>(quantizer->addr)
+      ->view();
+  }
+  return reinterpret_cast<
+           cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<float, int64_t>*>(
+           quantizer->addr)
+    ->quantizer;
 }
 
 template <typename T>
@@ -253,6 +307,74 @@ extern "C" cuvsError_t cuvsBbqQuantizerCreateView(
                 dtype.code,
                 dtype.bits);
     }
+  });
+}
+
+extern "C" cuvsError_t cuvsBbqQuantizerParamsCreate(cuvsBbqQuantizerParams_t* params)
+{
+  return cuvs::core::translate_exceptions([=] {
+    RAFT_EXPECTS(params != nullptr, "cuvsBbqQuantizerParamsCreate: null output");
+    *params = new cuvsBbqQuantizerParams{.doc_layout   = CUVS_BBQ_CODE_LAYOUT_PACKED_1B,
+                                         .query_layout = CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B,
+                                         .metric       = L2Expanded,
+                                         .lambda       = 0.1f,
+                                         .iters        = 5};
+  });
+}
+
+extern "C" cuvsError_t cuvsBbqQuantizerParamsDestroy(cuvsBbqQuantizerParams_t params)
+{
+  return cuvs::core::translate_exceptions([=] { delete params; });
+}
+
+extern "C" cuvsError_t cuvsBbqQuantizerBuild(cuvsResources_t res,
+                                             DLManagedTensor* dataset,
+                                             cuvsBbqQuantizer_t* quantizer)
+{
+  return cuvs::core::translate_exceptions([=] {
+    using quantizer_t = cuvs::preprocessing::quantize::bbq::quantizer<float>;
+    RAFT_EXPECTS(quantizer != nullptr, "cuvsBbqQuantizerBuild: null output");
+    *quantizer    = nullptr;
+    auto* res_ptr = reinterpret_cast<raft::resources*>(res);
+    auto built    = std::make_unique<quantizer_t>(cuvs::preprocessing::quantize::bbq::build(
+      *res_ptr, float_dataset_from_dlpack(dataset, "cuvsBbqQuantizerBuild")));
+
+    auto handle          = std::make_unique<cuvsBbqQuantizer>();
+    handle->addr         = reinterpret_cast<uintptr_t>(built.release());
+    handle->destroy_addr = &destroy_owned<quantizer_t>;
+    handle->dtype        = DLDataType{kDLFloat, 32, 1};
+    handle->is_owning    = true;
+    *quantizer           = handle.release();
+  });
+}
+
+extern "C" cuvsError_t cuvsBbqQuantizerTransform(cuvsResources_t res,
+                                                 cuvsBbqQuantizerParams_t params,
+                                                 cuvsBbqQuantizer_t quantizer,
+                                                 DLManagedTensor* dataset,
+                                                 cuvsDataset_t* bbq_dataset)
+{
+  return cuvs::core::translate_exceptions([=] {
+    using dataset_t = cuvs::neighbors::device_bbq_dataset<float, int64_t>;
+    RAFT_EXPECTS(bbq_dataset != nullptr, "cuvsBbqQuantizerTransform: null output");
+    *bbq_dataset = nullptr;
+    RAFT_EXPECTS(params != nullptr, "cuvsBbqQuantizerTransform: null params");
+    auto* res_ptr = reinterpret_cast<raft::resources*>(res);
+    auto encoded =
+      std::make_unique<dataset_t>(cuvs::preprocessing::quantize::bbq::transform(
+        *res_ptr,
+        to_cpp_params(*params),
+        get_cpp_centroid_view(quantizer),
+        float_dataset_from_dlpack(dataset, "cuvsBbqQuantizerTransform")));
+
+    auto handle          = std::make_unique<cuvsDataset>();
+    handle->addr         = reinterpret_cast<uintptr_t>(encoded.release());
+    handle->destroy_addr = &destroy_owned<dataset_t>;
+    handle->dtype        = DLDataType{kDLFloat, 32, 1};
+    handle->mem_type     = CUVS_DATASET_MEM_TYPE_DEVICE;
+    handle->layout       = CUVS_DATASET_LAYOUT_BBQ;
+    handle->is_owning    = true;
+    *bbq_dataset         = handle.release();
   });
 }
 

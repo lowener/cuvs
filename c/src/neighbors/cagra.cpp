@@ -434,13 +434,12 @@ template <typename T>
 auto get_cpp_bbq_quantizer_view(cuvsBbqQuantizer_t quantizer)
   -> cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>
 {
-  using owner_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_owning_storage<T, int64_t>;
-  using view_t  = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
+  using view_t = cuvs::preprocessing::quantize::bbq::bbq_dataset_view_storage<T, int64_t>;
   RAFT_EXPECTS(quantizer != nullptr && quantizer->addr != 0,
                "cuvsDatasetMakeBbqView: null quantizer storage");
-  if (quantizer->is_owning) {
-    return reinterpret_cast<owner_t*>(quantizer->addr)->view();
-  }
+  RAFT_EXPECTS(!quantizer->is_owning,
+               "cuvsDatasetMakeBbqView: a quantizer from cuvsBbqQuantizerBuild holds no encoded "
+               "rows; encode a dataset with cuvsBbqQuantizerTransform instead");
   return *reinterpret_cast<view_t*>(quantizer->addr);
 }
 

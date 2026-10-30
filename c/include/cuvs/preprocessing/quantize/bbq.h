@@ -162,6 +162,98 @@ CUVS_EXPORT cuvsError_t cuvsDatasetMakeBbqView(cuvsResources_t res,
                                                size_t num_quantizers,
                                                cuvsDataset_t* dataset);
 
+/**
+ * @brief Parameters for encoding a dataset with `cuvsBbqQuantizerTransform`.
+ */
+struct cuvsBbqQuantizerParams {
+  /** Code layout of the encoded rows on the document side of a distance. */
+  cuvsBbqCodeLayout_t doc_layout;
+  /**
+   * Code layout of the encoded rows on the query side of a distance. When it differs from
+   * `doc_layout`, the dataset is encoded a second time in this layout.
+   */
+  cuvsBbqCodeLayout_t query_layout;
+  /** Selects the per-row additional correction: ||x - c||^2 for L2, x.c otherwise. */
+  cuvsDistanceType metric;
+  /**
+   * Relative interval weight of the quantization error against the norm-preserving term of the
+   * loss.
+   */
+  float lambda;
+  /** Coordinate descent iterations per row. */
+  int iters;
+};
+
+typedef struct cuvsBbqQuantizerParams* cuvsBbqQuantizerParams_t;
+
+/**
+ * @brief Allocate BBQ quantizer params, and populate with default values
+ *
+ * Defaults: `CUVS_BBQ_CODE_LAYOUT_PACKED_1B` documents, `CUVS_BBQ_CODE_LAYOUT_TRANSPOSED_4B`
+ * queries, `L2Expanded`, `lambda` 0.1 and 5 `iters`.
+ *
+ * @param[out] params cuvsBbqQuantizerParams_t to allocate
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerParamsCreate(cuvsBbqQuantizerParams_t* params);
+
+/**
+ * @brief De-allocate BBQ quantizer params
+ *
+ * @param[in] params cuvsBbqQuantizerParams_t to de-allocate
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerParamsDestroy(cuvsBbqQuantizerParams_t params);
+
+/**
+ * @brief Build a BBQ quantizer from a dataset: computes the centroid shared by every row.
+ *
+ * The returned handle owns the centroid and its squared norm, and only serves to encode datasets
+ * with `cuvsBbqQuantizerTransform`: it holds no encoded rows, so `cuvsDatasetMakeBbqView` rejects
+ * it. Destroy it with `cuvsBbqQuantizerDestroy`.
+ *
+ * @code{.c}
+ * cuvsBbqQuantizerParams_t params;
+ * cuvsBbqQuantizerParamsCreate(&params);
+ * cuvsBbqQuantizer_t quantizer;
+ * cuvsBbqQuantizerBuild(res, &dataset, &quantizer);
+ * cuvsDataset_t bbq_dataset;
+ * cuvsBbqQuantizerTransform(res, params, quantizer, &dataset, &bbq_dataset);
+ * cuvsBbqQuantizerDestroy(quantizer);  // `bbq_dataset` holds its own copy of the centroid
+ * cuvsCagraBuild(res, index_params, bbq_dataset, index);
+ * @endcode
+ *
+ * @param[in] res cuVS resources
+ * @param[in] dataset float32 row-major device matrix
+ * @param[out] quantizer newly allocated owning quantizer handle
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerBuild(cuvsResources_t res,
+                                              DLManagedTensor* dataset,
+                                              cuvsBbqQuantizer_t* quantizer);
+
+/**
+ * @brief Encode a dataset against the centroid of a BBQ quantizer into an owning BBQ dataset.
+ *
+ * The dataset holds one storage in `params->doc_layout`, plus one in `params->query_layout` when it
+ * differs, and its own copy of the centroid, so it does not depend on `quantizer` or `dataset` once
+ * returned. `quantizer` is either built by `cuvsBbqQuantizerBuild`, or a float32 view from
+ * `cuvsBbqQuantizerCreateView`, whose centroid is then reused. Destroy the result with
+ * `cuvsDatasetDestroy`.
+ *
+ * @param[in] res cuVS resources
+ * @param[in] params encoding parameters
+ * @param[in] quantizer BBQ quantizer whose centroid the rows are encoded against
+ * @param[in] in_dataset float32 row-major device matrix with the quantizer's dimension
+ * @param[out] bbq_dataset newly allocated owning `CUVS_DATASET_LAYOUT_BBQ` device dataset handle
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsBbqQuantizerTransform(cuvsResources_t res,
+                                                  cuvsBbqQuantizerParams_t params,
+                                                  cuvsBbqQuantizer_t quantizer,
+                                                  DLManagedTensor* in_dataset,
+                                                  cuvsDataset_t* bbq_dataset);
+
 /** @} */
 
 #ifdef __cplusplus
