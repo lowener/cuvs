@@ -19,6 +19,7 @@
 #include <raft/core/logger.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resource/cuda_stream_pool.hpp>
+#include <raft/core/resource/device_properties.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/linalg/map.cuh>
 #include <raft/stats/mean.cuh>
@@ -27,6 +28,8 @@
 #include <raft/util/pow2_utils.cuh>
 #include <raft/util/vectorized.cuh>
 #include <raft/util/warp_primitives.cuh>
+
+#include <cuda_pipeline_primitives.h>
 
 // A temporary stub till https://github.com/NVIDIA/raft/pull/2077 is re-merged
 namespace cuvs::util {
@@ -805,6 +808,268 @@ __launch_bounds__(BlockSize) RAFT_KERNEL process_and_fill_codes_subspaces_kernel
   }
 }
 
+/** Rows and subspaces encoded by one 256-thread block of the TF32 subspace encoder. */
+constexpr uint32_t kTf32EncodeRows  = 256;
+constexpr uint32_t kTf32EncodeChunk = 32;  // kTf32EncodeChunk * pq_bits is a whole byte count
+
+__device__ __forceinline__ uint32_t to_tf32(float x)
+{
+  uint32_t r;
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+  return r;
+}
+
+/** The TF32 rounding of `x`, or with `lo` the TF32 rounding of what that leaves out. */
+__device__ __forceinline__ uint32_t tf32_part(float x, bool lo)
+{
+  const uint32_t hi = to_tf32(x);
+  return lo ? to_tf32(x - __uint_as_float(hi)) : hi;
+}
+
+/** Segment of GEMM K index k in the TF32 encoder: 0 for k < pq_len, 1 for k < 2 * pq_len, ... */
+__device__ __forceinline__ uint32_t tf32_segment(uint32_t k, uint32_t pq_len)
+{
+  return uint32_t{k >= pq_len} + uint32_t{k >= 2 * pq_len};
+}
+
+/**
+ * Packs every subspace codebook as the m16n8k8 B-fragments of the TF32 encoder followed by the
+ * FP32 center norms: subspace j takes (k_len + 1) * n_centers words, with K index k of center c at
+ * [k / 4][c / 8][(c % 8) * 4 + k % 4]. The K axis holds n_terms TF32 parts of -2c (see below),
+ * then 1.
+ */
+template <typename MathT>
+RAFT_KERNEL pack_tf32_codebooks_kernel(
+  uint32_t* packed,
+  raft::device_matrix_view<const MathT, uint32_t, raft::row_major> pq_centers,
+  uint32_t n_centers,
+  uint32_t k_len,
+  uint32_t n_terms)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= pq_centers.extent(0)) { return; }
+  const uint32_t pq_len = pq_centers.extent(1);
+  const uint32_t c      = row % n_centers;
+  uint32_t* out         = packed + size_t{row / n_centers} * (k_len + 1) * n_centers;
+  float norm            = 0.0f;
+  for (uint32_t k = 0; k < pq_len; k++) {
+    const float v = pq_centers(row, k);
+    norm += v * v;
+  }
+  for (uint32_t k = 0; k < k_len; k++) {
+    const uint32_t s = tf32_segment(k, pq_len);
+    uint32_t b       = 0;
+    if (k < n_terms * pq_len) {
+      b = tf32_part(-2.0f * static_cast<float>(pq_centers(row, k - s * pq_len)), s == 2);
+    } else if (k == n_terms * pq_len) {
+      b = __float_as_uint(1.0f);
+    }
+    out[(k / 4) * n_centers * 4 + (c / 8) * 32 + (c % 8) * 4 + k % 4] = b;
+  }
+  out[k_len * n_centers + c] = __float_as_uint(norm);
+#endif
+}
+
+/**
+ * Tensor-core (TF32, sm_80+) variant of `process_and_fill_codes_subspaces_kernel`.
+ *
+ * A block encodes kRows rows over a chunk of kChunk subspaces, copying the codebooks packed by
+ * `pack_tf32_codebooks_kernel` to shared memory one subspace ahead (double-buffered dynamic shared
+ * memory of 2 packed codebooks). The MMA accumulator starts from the FP32 norms ||c||^2, so that
+ * the MMA yields ||c||^2 - 2<x, c> + ||x||^2. The GEMM K axis lays out
+ *   A = [x | ||x||^2],  B = [-2c | 1]                                   (Split = false), or
+ *   A = [x_hi | x_lo | x_hi | ||x||^2],  B = [-2c_hi | -2c_hi | -2c_lo | 1]  (Split = true),
+ * where the split form recovers FP32-level accuracy of <x, c> (3xTF32) inside the K padding. The
+ * ||x||^2 slot is dropped when it does not fit the padding; it is a per-row constant, so the argmin
+ * does not depend on it, but it keeps the distances small and thus the error of the argmin tag,
+ * which carries the center index in the low 8 mantissa bits (at most 2^-15 relative).
+ */
+template <uint32_t NTiles,
+          uint32_t KSteps,
+          bool Split,
+          typename DataT,
+          typename MathT,
+          typename IdxT,
+          typename LabelT>
+// Past 2 k-steps, the shared memory of the double-buffered codebooks caps occupancy at 3 blocks.
+__launch_bounds__(256, KSteps <= 2 ? 4 : 3) RAFT_KERNEL
+  process_and_fill_codes_subspaces_tf32_kernel(
+    raft::device_matrix_view<uint8_t, IdxT, raft::row_major> out_codes,
+    raft::device_matrix_view<const DataT, IdxT, raft::row_major> dataset,
+    const uint32_t* packed_centers,
+    const uint32_t pq_len,
+    raft::device_matrix_view<const MathT, uint32_t, raft::row_major> vq_centers,
+    raft::device_vector_view<const LabelT, IdxT, raft::row_major> vq_labels,
+    const uint32_t pq_bits)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr uint32_t kRows    = kTf32EncodeRows;
+  constexpr uint32_t kChunk   = kTf32EncodeChunk;
+  constexpr uint32_t kMTiles  = kRows / (256 / raft::WarpSize) / 16;  // 16-row MMA tiles per warp
+  constexpr uint32_t kCenters = NTiles * 8;
+  constexpr uint32_t kK       = KSteps * 8;
+  constexpr uint32_t kTerms   = Split ? 3 : 1;
+  constexpr uint32_t kBook    = (kK + 1) * kCenters;  // words of a packed subspace codebook
+  extern __shared__ uint4 tf32_books[];               // two packed codebooks, double-buffered
+  __shared__ uint8_t codes[kRows][kChunk];
+
+  auto data_mapping        = cuvs::spatial::knn::detail::utils::mapping<float>{};
+  const uint32_t lane      = raft::laneId();
+  const uint32_t group     = lane / 4;
+  const uint32_t tig       = lane % 4;
+  const uint32_t pq_dim    = raft::div_rounding_up_unsafe(dataset.extent(1), pq_len);
+  const uint32_t norm_slot = kTerms * pq_len;  // K index of ||x||^2; unused if >= kK
+  const IdxT row0          = IdxT{blockIdx.x} * kRows;
+  const uint32_t j0        = blockIdx.y * kChunk;
+  const uint32_t j1        = std::min(j0 + kChunk, pq_dim);
+
+  for (uint32_t i = threadIdx.x; i < sizeof(codes); i += blockDim.x) {
+    (&codes[0][0])[i] = 0;
+  }
+  auto stage = [&](uint32_t j) {
+    const auto* src = reinterpret_cast<const uint4*>(packed_centers + size_t{j} * kBook);
+    uint4* dst      = tf32_books + (j - j0) % 2 * (kBook / 4);
+    for (uint32_t i = threadIdx.x; i < kBook / 4; i += blockDim.x) {
+      __pipeline_memcpy_async(dst + i, src + i, sizeof(uint4));
+    }
+    __pipeline_commit();
+  };
+  stage(j0);
+
+  // This thread reads rows (m, h) of its warp's MMA tiles; lanes with tig == 0 own their codes.
+  auto local_row = [&](uint32_t m, uint32_t h) {
+    return threadIdx.x / raft::WarpSize * kMTiles * 16 + m * 16 + h * 8 + group;
+  };
+  LabelT labels[kMTiles][2];
+#pragma unroll
+  for (uint32_t m = 0; m < kMTiles; m++) {
+#pragma unroll
+    for (uint32_t h = 0; h < 2; h++) {
+      const IdxT row = row0 + local_row(m, h);
+      labels[m][h]   = (!vq_labels.empty() && row < dataset.extent(0)) ? vq_labels(row) : 0;
+    }
+  }
+
+  for (uint32_t j = j0; j < j1; j++) {
+    const auto* book   = reinterpret_cast<const uint32_t*>(tf32_books + (j - j0) % 2 * (kBook / 4));
+    const float* norms = reinterpret_cast<const float*>(book + kK * kCenters);
+
+    // A-fragment q of m16n8k8 holds row group + 8 * (q & 1), column tig + 4 * (q >> 1).
+    float x[kMTiles][KSteps][4];
+    float x_norm[kMTiles][2] = {};
+#pragma unroll
+    for (uint32_t m = 0; m < kMTiles; m++) {
+#pragma unroll
+      for (uint32_t ks = 0; ks < KSteps; ks++) {
+#pragma unroll
+        for (uint32_t q = 0; q < 4; q++) {
+          const uint32_t h = q & 1;
+          const IdxT row   = row0 + local_row(m, h);
+          const uint32_t k = ks * 8 + tig + 4 * (q >> 1);
+          const uint32_t s = tf32_segment(k, pq_len);
+          x[m][ks][q]      = 0.0f;
+          if (row < dataset.extent(0) && k < kTerms * pq_len) {
+            const uint32_t col = j * pq_len + k - s * pq_len;
+            x[m][ks][q]        = data_mapping(dataset(row, col));
+            if (!vq_centers.empty()) { x[m][ks][q] -= vq_centers(labels[m][h], col); }
+            if (s == 0) { x_norm[m][h] += x[m][ks][q] * x[m][ks][q]; }
+          }
+        }
+      }
+    }
+    __pipeline_wait_prior(0);
+    __syncthreads();  // codebook j is staged and nobody reads codebook j - 1 anymore
+    if (j + 1 < j1) { stage(j + 1); }
+
+    uint32_t a[kMTiles][KSteps][4];
+#pragma unroll
+    for (uint32_t m = 0; m < kMTiles; m++) {
+#pragma unroll
+      for (uint32_t h = 0; h < 2; h++) {
+        x_norm[m][h] += raft::shfl_xor(x_norm[m][h], 1);
+        x_norm[m][h] += raft::shfl_xor(x_norm[m][h], 2);
+      }
+#pragma unroll
+      for (uint32_t ks = 0; ks < KSteps; ks++) {
+#pragma unroll
+        for (uint32_t q = 0; q < 4; q++) {
+          const uint32_t k = ks * 8 + tig + 4 * (q >> 1);
+          a[m][ks][q]      = k == norm_slot
+                               ? to_tf32(x_norm[m][q & 1])
+                               : tf32_part(x[m][ks][q], Split && tf32_segment(k, pq_len) == 1);
+        }
+      }
+    }
+
+    float best[kMTiles][2];
+#pragma unroll
+    for (uint32_t m = 0; m < kMTiles; m++) {
+      best[m][0] = best[m][1] = std::numeric_limits<float>::infinity();
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < NTiles; t++) {
+      // Accumulator element q holds center t * 8 + 2 * tig + (q & 1).
+      const float2 norm = *reinterpret_cast<const float2*>(norms + t * 8 + 2 * tig);
+      uint32_t b[KSteps][2];
+#pragma unroll
+      for (uint32_t ks = 0; ks < KSteps; ks++) {
+        b[ks][0] = book[((2 * ks) * NTiles + t) * raft::WarpSize + lane];
+        b[ks][1] = book[((2 * ks + 1) * NTiles + t) * raft::WarpSize + lane];
+      }
+#pragma unroll
+      for (uint32_t m = 0; m < kMTiles; m++) {
+        float d[4] = {norm.x, norm.y, norm.x, norm.y};
+#pragma unroll
+        for (uint32_t ks = 0; ks < KSteps; ks++) {
+          asm(
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[m][ks][0]),
+              "r"(a[m][ks][1]),
+              "r"(a[m][ks][2]),
+              "r"(a[m][ks][3]),
+              "r"(b[ks][0]),
+              "r"(b[ks][1]));
+        }
+#pragma unroll
+        for (uint32_t q = 0; q < 4; q++) {
+          const float tagged =
+            __uint_as_float((__float_as_uint(d[q]) & ~0xFFu) | (t * 8 + (q & 1)));
+          best[m][q / 2] = fminf(best[m][q / 2], tagged);
+        }
+      }
+    }
+#pragma unroll
+    for (uint32_t m = 0; m < kMTiles; m++) {
+#pragma unroll
+      for (uint32_t h = 0; h < 2; h++) {
+        const uint32_t bits = __float_as_uint(best[m][h]);
+        float v             = __uint_as_float((bits & ~0xFFu) | ((bits & 0xFFu) + 2 * tig));
+        v                   = fminf(v, raft::shfl_xor(v, 1));
+        v                   = fminf(v, raft::shfl_xor(v, 2));
+        if (tig == 0) {
+          cuvs::preprocessing::quantize::pq::detail::bitfield_view_t code_view{
+            &codes[local_row(m, h)][0], pq_bits};
+          code_view[j - j0] = static_cast<uint8_t>(__float_as_uint(v) & 0xFFu);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  const uint32_t n_bytes = raft::div_rounding_up_unsafe((j1 - j0) * pq_bits, 8u);
+  const uint32_t byte0   = j0 * pq_bits / 8;
+  for (uint32_t i = threadIdx.x; i < kRows * n_bytes; i += blockDim.x) {
+    const IdxT row = row0 + i / n_bytes;
+    if (row < dataset.extent(0)) {
+      out_codes(row, byte0 + i % n_bytes) = codes[i / n_bytes][i % n_bytes];
+    }
+  }
+#endif
+}
+
 template <typename MathT, typename IdxT, typename DatasetT>
 void process_and_fill_codes_subspaces(
   const raft::resources& res,
@@ -877,6 +1142,63 @@ void process_and_fill_codes_subspaces(
     }
   }(pq_bits);
 
+  // ponytail: the TF32 encoder covers pq_bits <= 8 (the center index must fit the 8 tag bits) and
+  // either pq_len <= 10 (3xTF32 within 4 MMA k-steps) or 16 <= pq_len <= 32 (plain TF32, which, as
+  // in the k-means 1-NN, mislabels near-ties below 16 features). Other shapes and pre-sm_80 GPUs
+  // keep the SIMT kernel; 11 <= pq_len < 16 would need 3xTF32 over 5-6 k-steps.
+  const bool split     = 3 * pq_len <= 32;
+  const uint32_t n_k   = (split ? 3 : 1) * pq_len;
+  const uint32_t k_len = raft::round_up_safe<uint32_t>(n_k, 8);
+  const bool use_tf32  = pq_bits <= 8 && (split || (pq_len >= 16 && pq_len <= 32)) &&
+                        raft::resource::get_device_properties(res).major >= 8;
+  auto tf32_kernel = [k_len, split](uint32_t pq_bits) {
+    auto with_ksteps = [k_len, split](auto n_tiles) {
+      constexpr uint32_t kNTiles = decltype(n_tiles)::value;
+
+      auto pick = [](auto k_steps, auto is_split) {
+        return process_and_fill_codes_subspaces_tf32_kernel<kNTiles,
+                                                            decltype(k_steps)::value,
+                                                            decltype(is_split)::value,
+                                                            data_t,
+                                                            MathT,
+                                                            IdxT,
+                                                            label_t>;
+      };
+      using std::integral_constant;
+      switch (split ? k_len / 8 : k_len / 8 + 4) {
+        case 1: return pick(integral_constant<uint32_t, 1>{}, std::true_type{});
+        case 2: return pick(integral_constant<uint32_t, 2>{}, std::true_type{});
+        case 3: return pick(integral_constant<uint32_t, 3>{}, std::true_type{});
+        case 4: return pick(integral_constant<uint32_t, 4>{}, std::true_type{});
+        case 6: return pick(integral_constant<uint32_t, 2>{}, std::false_type{});
+        case 7: return pick(integral_constant<uint32_t, 3>{}, std::false_type{});
+        case 8: return pick(integral_constant<uint32_t, 4>{}, std::false_type{});
+        default: return pick(integral_constant<uint32_t, 4>{}, std::false_type{});
+      }
+    };
+    switch (pq_bits) {
+      case 4: return with_ksteps(std::integral_constant<uint32_t, 2>{});
+      case 5: return with_ksteps(std::integral_constant<uint32_t, 4>{});
+      case 6: return with_ksteps(std::integral_constant<uint32_t, 8>{});
+      case 7: return with_ksteps(std::integral_constant<uint32_t, 16>{});
+      case 8: return with_ksteps(std::integral_constant<uint32_t, 32>{});
+      default: return with_ksteps(std::integral_constant<uint32_t, 32>{});
+    }
+  }(pq_bits);
+  auto packed_centers = raft::make_device_vector<uint32_t, uint32_t>(
+    res, use_tf32 ? pq_dim * (k_len + 1) * pq_n_centers : 0);
+  const size_t tf32_smem = 2 * (k_len + 1) * pq_n_centers * sizeof(uint32_t);
+  if (use_tf32) {
+    RAFT_CUDA_TRY(cudaFuncSetAttribute(
+      tf32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tf32_smem)));
+    pack_tf32_codebooks_kernel<<<raft::div_rounding_up_safe<uint32_t>(pq_centers.extent(0), 256),
+                                 256,
+                                 0,
+                                 stream.get()>>>(
+      packed_centers.data_handle(), pq_centers, pq_n_centers, k_len, n_k / pq_len);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
+  }
+
   ix_t max_batch_size = std::min<ix_t>(n_rows, kReasonableMaxBatchSize);
   auto copy_stream    = raft::resource::get_cuda_stream(res);  // Using the main stream by default
   bool enable_prefetch_stream = false;
@@ -891,16 +1213,31 @@ void process_and_fill_codes_subspaces(
     if (!vq_labels.empty() && !vq_centers.empty()) {
       predict_vq<label_t>(res, dataset_view, vq_centers, labels_view);
     }
-    dim3 blocks(
-      raft::div_rounding_up_safe<ix_t>(dataset_view.extent(0), kBlockSize / threads_per_vec), 1, 1);
-    kernel<<<blocks, threads, shared_memory_size, stream.get()>>>(
-      codes_view,
-      dataset_view,
-      pq_centers,
-      vq_centers,
-      raft::make_const_mdspan(labels_view),
-      pq_bits,
-      shared_memory_size > 0);
+    if (use_tf32) {
+      dim3 blocks(raft::div_rounding_up_safe<ix_t>(dataset_view.extent(0), kTf32EncodeRows),
+                  raft::div_rounding_up_safe<ix_t>(pq_dim, kTf32EncodeChunk),
+                  1);
+      tf32_kernel<<<blocks, 256, tf32_smem, stream.get()>>>(codes_view,
+                                                            dataset_view,
+                                                            packed_centers.data_handle(),
+                                                            pq_len,
+                                                            vq_centers,
+                                                            raft::make_const_mdspan(labels_view),
+                                                            pq_bits);
+    } else {
+      dim3 blocks(
+        raft::div_rounding_up_safe<ix_t>(dataset_view.extent(0), kBlockSize / threads_per_vec),
+        1,
+        1);
+      kernel<<<blocks, threads, shared_memory_size, stream.get()>>>(
+        codes_view,
+        dataset_view,
+        pq_centers,
+        vq_centers,
+        raft::make_const_mdspan(labels_view),
+        pq_bits,
+        shared_memory_size > 0);
+    }
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   };
   if (!need_batching && !need_copy_to_device) {
